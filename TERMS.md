@@ -54,4 +54,4 @@ These terms may be updated from time to time. Continued use of the service after
 
 ## 10. Contact
 
-Questions about these terms may be sent to <continental.auth@gmail.com>.
+Questions about these terms may be sent through <https://contact.continental-hub.com>.
