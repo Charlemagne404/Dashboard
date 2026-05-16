@@ -172,6 +172,7 @@ const DEFAULT_DASHBOARD_ORIGIN = 'https://dashboard.continental-hub.com';
 const DEFAULT_LOGIN_ORIGIN = 'https://login.continental-hub.com';
 const DEFAULT_VANGUARD_ORIGIN = 'https://vanguard.continental-hub.com';
 const DEFAULT_OAUTH_APP_ORIGINS = [
+  'https://blueprint.continental-hub.com',
   DEFAULT_DASHBOARD_ORIGIN,
   DEFAULT_LOGIN_ORIGIN,
   'https://pulse.continental-hub.com',
@@ -192,8 +193,7 @@ const configuredOauthAppOrigins = Array.from(
   )
 );
 const allowDefaultOauthAppOrigins =
-  String(process.env.NODE_ENV || 'development') !== 'production' ||
-  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'false') === 'true';
+  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'true') !== 'false';
 const OAUTH_APP_ORIGINS = new Set([
   ...(allowDefaultOauthAppOrigins ? DEFAULT_OAUTH_APP_ORIGINS : []),
   ...configuredOauthAppOrigins,

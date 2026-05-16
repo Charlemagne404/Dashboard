@@ -1,8 +1,12 @@
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1']);
 const HOSTED_STATIC_HOSTS = new Set([
+  'blueprint.continental-hub.com',
   'dashboard.continental-hub.com',
   'grimoire.continental-hub.com',
   'login.continental-hub.com',
+  'pulse.continental-hub.com',
+  'stepcast.continental-hub.com',
+  'vanguard.continental-hub.com',
   'charlemagne404.github.io',
   'mpmc.ddns.net',
 ]);
@@ -7784,20 +7788,36 @@ const setupEventHandlers = () => {
 
     if (messageType !== 'LOGIN_SUCCESS') return;
 
-    const refreshed = await refreshSession();
-    if (!refreshed.ok) {
-      showToast('Signed in, but the session could not be established.', 'error');
-      return;
+    const messageApiBase = normalizeApiBaseUrl(event.data?.apiBaseUrl);
+    if (messageApiBase) {
+      API_BASE_URL = messageApiBase;
+      apiBaseValidated = true;
+      rememberApiBaseUrl(messageApiBase);
     }
 
     try {
+      storeSession(event.data || {});
       await loadDashboardData({ silent: true });
       closeLoginPopup();
       showApp();
       startSessionAutoRefresh();
       showToast('Signed in successfully.', 'success');
     } catch (err) {
-      showToast(err.message || 'Could not load account data.', 'error');
+      const refreshed = await refreshSession();
+      if (!refreshed.ok) {
+        showToast('Signed in, but the session could not be established.', 'error');
+        return;
+      }
+
+      try {
+        await loadDashboardData({ silent: true });
+        closeLoginPopup();
+        showApp();
+        startSessionAutoRefresh();
+        showToast('Signed in successfully.', 'success');
+      } catch (retryError) {
+        showToast(retryError.message || 'Could not load account data.', 'error');
+      }
     }
   });
 

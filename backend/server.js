@@ -22,6 +22,7 @@ const { migrateUsersToLatestIdentity } = require('./utils/userIdentity');
 const app = express();
 
 const DEFAULT_ALLOWED_ORIGINS = [
+  'https://blueprint.continental-hub.com',
   'https://charlemagne404.github.io',
   'https://dashboard.continental-hub.com',
   'https://grimoire.continental-hub.com',
@@ -55,7 +56,7 @@ const config = {
 };
 const isProduction = config.nodeEnv === 'production';
 const allowDefaultTrustedOrigins =
-  !isProduction || String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'false') === 'true';
+  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'true') !== 'false';
 const allowLocalDevOrigins =
   !isProduction || String(process.env.ALLOW_LOCALHOST_ORIGINS || 'false') === 'true';
 

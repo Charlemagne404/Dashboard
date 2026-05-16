@@ -469,6 +469,7 @@ const finishAuth = (payload) => {
         accessToken: safeText(payload?.accessToken || payload?.token),
         token: safeText(payload?.accessToken || payload?.token),
         user: payload?.user || null,
+        apiBaseUrl: trimTrailingSlash(API_BASE_URL),
       },
       targetOrigin
     );

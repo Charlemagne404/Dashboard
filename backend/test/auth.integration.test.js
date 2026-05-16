@@ -23,6 +23,8 @@ const { dedupePasskeysAcrossUsers } = require('../utils/passkeyHardening');
 
 const TEST_ORIGIN = 'http://localhost:3000';
 const TERRA_TRECK_PAGES_ORIGIN = 'https://charlemagne404.github.io';
+const BLUEPRINT_ORIGIN = 'https://blueprint.continental-hub.com';
+const DASHBOARD_ORIGIN = 'https://dashboard.continental-hub.com';
 const PULSE_ORIGIN = 'https://pulse.continental-hub.com';
 
 const sha256 = (value) =>
@@ -143,6 +145,35 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
   assert.equal(refreshResponse.status, 200);
   assert.equal(refreshResponse.body.message, 'Session refreshed.');
   assert.ok(refreshResponse.body.accessToken);
+});
+
+test('Blueprint hosted origin is trusted consistently by popup config and backend CORS', async () => {
+  const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
+  const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
+
+  assert.match(popupConfigSource, /https:\/\/blueprint\.continental-hub\.com/);
+
+  const preflightResponse = await request(app)
+    .options('/api/auth/refresh_token')
+    .set('Origin', BLUEPRINT_ORIGIN)
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'content-type');
+
+  assert.equal(preflightResponse.status, 204);
+  assert.equal(preflightResponse.headers['access-control-allow-origin'], BLUEPRINT_ORIGIN);
+  assert.equal(preflightResponse.headers['access-control-allow-credentials'], 'true');
+});
+
+test('Dashboard hosted origin remains trusted by backend CORS', async () => {
+  const preflightResponse = await request(app)
+    .options('/api/auth/refresh_token')
+    .set('Origin', DASHBOARD_ORIGIN)
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'content-type');
+
+  assert.equal(preflightResponse.status, 204);
+  assert.equal(preflightResponse.headers['access-control-allow-origin'], DASHBOARD_ORIGIN);
+  assert.equal(preflightResponse.headers['access-control-allow-credentials'], 'true');
 });
 
 test('register creates an unverified account and blocks login until verification', async () => {
