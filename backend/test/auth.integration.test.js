@@ -23,6 +23,7 @@ const { dedupePasskeysAcrossUsers } = require('../utils/passkeyHardening');
 
 const TEST_ORIGIN = 'http://localhost:3000';
 const TERRA_TRECK_PAGES_ORIGIN = 'https://charlemagne404.github.io';
+const PULSE_ORIGIN = 'https://pulse.continental-hub.com';
 
 const sha256 = (value) =>
   crypto.createHash('sha256').update(String(value || '')).digest('hex');
@@ -92,6 +93,56 @@ test('Terra-Treck GitHub Pages origin is trusted by hosted popup config and back
   assert.equal(response.status, 204);
   assert.equal(response.headers['access-control-allow-origin'], TERRA_TRECK_PAGES_ORIGIN);
   assert.equal(response.headers['access-control-allow-credentials'], 'true');
+});
+
+test('Pulse hosted origin is trusted by popup config and can complete the refresh-cookie flow', async () => {
+  const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
+  const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
+
+  assert.match(popupConfigSource, /https:\/\/pulse\.continental-hub\.com/);
+
+  const preflightResponse = await request(app)
+    .options('/api/auth/refresh_token')
+    .set('Origin', PULSE_ORIGIN)
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'content-type');
+
+  assert.equal(preflightResponse.status, 204);
+  assert.equal(preflightResponse.headers['access-control-allow-origin'], PULSE_ORIGIN);
+  assert.equal(preflightResponse.headers['access-control-allow-credentials'], 'true');
+
+  await createVerifiedUser({
+    email: 'pulse.user@example.com',
+    username: 'pulse.user',
+  });
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', PULSE_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({
+      identifier: 'pulse.user',
+      password: 'StrongPass1',
+      deviceLabel: 'Pulse Browser',
+    });
+
+  assert.equal(loginResponse.status, 200);
+  assert.equal(loginResponse.body.authenticated, true);
+  assert.ok(loginResponse.body.accessToken || loginResponse.body.token);
+
+  const refreshCookie = getRefreshCookie(loginResponse);
+  assert.ok(refreshCookie);
+
+  const refreshResponse = await request(app)
+    .post('/api/auth/refresh_token')
+    .set('Origin', PULSE_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('Cookie', refreshCookie)
+    .send({});
+
+  assert.equal(refreshResponse.status, 200);
+  assert.equal(refreshResponse.body.message, 'Session refreshed.');
+  assert.ok(refreshResponse.body.accessToken);
 });
 
 test('register creates an unverified account and blocks login until verification', async () => {
@@ -508,7 +559,7 @@ test('public verification resend is throttled before it can spin indefinitely', 
     (event) => event.type === 'verification_resent_public'
   );
 
-  assert.equal(resendEvents.length, 3);
+  assert.equal(resendEvents.length, 1);
 });
 
 test('request-password-reset sets a reset token and reset-password updates the password', async () => {

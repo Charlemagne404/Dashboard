@@ -174,6 +174,7 @@ const DEFAULT_VANGUARD_ORIGIN = 'https://vanguard.continental-hub.com';
 const DEFAULT_OAUTH_APP_ORIGINS = [
   DEFAULT_DASHBOARD_ORIGIN,
   DEFAULT_LOGIN_ORIGIN,
+  'https://pulse.continental-hub.com',
   DEFAULT_VANGUARD_ORIGIN,
   'https://charlemagne404.github.io',
   'https://grimoire.continental-hub.com',

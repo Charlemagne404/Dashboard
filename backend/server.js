@@ -26,6 +26,7 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'https://dashboard.continental-hub.com',
   'https://grimoire.continental-hub.com',
   'https://login.continental-hub.com',
+  'https://pulse.continental-hub.com',
   'https://stepcast.continental-hub.com',
   'https://vanguard.continental-hub.com',
   'https://mpmc.ddns.net',
