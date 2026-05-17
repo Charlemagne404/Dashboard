@@ -124,7 +124,7 @@ const getAuthApiBase = () => `${API_BASE_URL}/api/auth`;
 function looksLikeAuthHealthPayload(payload) {
   const status = safeText(payload?.status).toLowerCase();
   const timestamp = safeText(payload?.timestamp);
-  if (!timestamp || !['ok', 'degraded'].includes(status)) {
+  if (!timestamp || !['ok'].includes(status)) {
     return false;
   }
 
@@ -166,7 +166,7 @@ async function ensureApiBaseUrl() {
 
     throw new Error(
       candidates.length
-        ? `No reachable Continental ID auth API was found. Checked: ${candidates.join(', ')}.`
+        ? `No healthy Continental ID auth API was found. Checked: ${candidates.join(', ')}.`
         : 'No trusted API base URL was configured for Continental ID.'
     );
   })();

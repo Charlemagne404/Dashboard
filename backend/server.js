@@ -33,15 +33,41 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'https://mpmc.ddns.net',
 ];
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+const isProduction = nodeEnv === 'production';
 const allowedOriginsFromEnv = String(process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
 
+const resolveHttpsMode = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || ['0', 'false', 'off', 'disabled'].includes(normalized)) {
+    return 'off';
+  }
+  if (normalized === 'auto') {
+    return 'auto';
+  }
+  if (['1', 'true', 'on', 'enabled', 'https'].includes(normalized)) {
+    return 'on';
+  }
+  return 'off';
+};
+
+const selectServerTransport = (httpsMode, hasHttpsFiles) => {
+  if (httpsMode === 'on') {
+    return 'https';
+  }
+  if (httpsMode === 'auto' && hasHttpsFiles) {
+    return 'https';
+  }
+  return 'http';
+};
+
 const config = {
   appName: process.env.APP_NAME || 'continental-id-auth',
-  nodeEnv: process.env.NODE_ENV || 'development',
-  host: process.env.HOST || '127.0.0.1',
+  nodeEnv,
+  host: process.env.HOST || (isProduction ? '0.0.0.0' : '127.0.0.1'),
   port: Number(process.env.PORT) || 5000,
   mongoUri: process.env.MONGO_URI,
   jwtSecret: process.env.JWT_SECRET,
@@ -53,8 +79,8 @@ const config = {
     process.env.HTTPS_KEY_PATH || '/etc/letsencrypt/live/mpmc.ddns.net/privkey.pem',
   httpsCertPath:
     process.env.HTTPS_CERT_PATH || '/etc/letsencrypt/live/mpmc.ddns.net/fullchain.pem',
+  httpsMode: resolveHttpsMode(process.env.HTTPS_MODE),
 };
-const isProduction = config.nodeEnv === 'production';
 const allowDefaultTrustedOrigins =
   String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'true') !== 'false';
 const allowLocalDevOrigins =
@@ -129,13 +155,30 @@ app.use((req, res, next) => {
 });
 
 app.use((req, res, next) => {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const originLikeUrl = String(req.headers.origin || req.headers.referer || '').trim();
+  let browserProtocol = '';
+  if (originLikeUrl) {
+    try {
+      browserProtocol = new URL(originLikeUrl).protocol.replace(':', '').toLowerCase();
+    } catch {
+      browserProtocol = '';
+    }
+  }
+
+  const isSecureRequest =
+    req.secure || forwardedProto === 'https' || (!forwardedProto && browserProtocol === 'https');
+
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Pragma', 'no-cache');
-  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+  if (isSecureRequest) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
   next();
@@ -313,6 +356,91 @@ mongoose.connection.on('error', (err) => {
   console.error('MongoDB connection error:', err);
 });
 
+const startupMaintenanceState = {
+  status: 'idle',
+  activeTask: '',
+  error: '',
+  startedAt: null,
+  completedAt: null,
+};
+
+let startupMaintenancePromise;
+
+const buildStartupMaintenanceSnapshot = () => ({
+  status: startupMaintenanceState.status,
+  activeTask: startupMaintenanceState.activeTask,
+  error: startupMaintenanceState.error,
+  startedAt: startupMaintenanceState.startedAt
+    ? new Date(startupMaintenanceState.startedAt).toISOString()
+    : null,
+  completedAt: startupMaintenanceState.completedAt
+    ? new Date(startupMaintenanceState.completedAt).toISOString()
+    : null,
+});
+
+const runMaintenanceTask = async (label, task, errors) => {
+  startupMaintenanceState.activeTask = label;
+  try {
+    await task();
+  } catch (err) {
+    errors.push(`${label}: ${err.message || err}`);
+    console.error(`Startup maintenance failed during ${label}:`, err);
+  }
+};
+
+const runStartupMaintenance = async () => {
+  if (startupMaintenancePromise) {
+    return startupMaintenancePromise;
+  }
+
+  startupMaintenanceState.status = 'running';
+  startupMaintenanceState.activeTask = '';
+  startupMaintenanceState.error = '';
+  startupMaintenanceState.startedAt = Date.now();
+  startupMaintenanceState.completedAt = null;
+
+  startupMaintenancePromise = (async () => {
+    const errors = [];
+
+    await runMaintenanceTask('user identity migration', () => migrateUsersToLatestIdentity({ logger: console }), errors);
+    await runMaintenanceTask(
+      'user security migration',
+      () => migrateUsersToLatestSecurityState({ logger: console }),
+      errors
+    );
+    await runMaintenanceTask(
+      'passkey dedupe',
+      () => dedupePasskeysAcrossUsers({ logger: console }),
+      errors
+    );
+    await runMaintenanceTask('user index sync', () => User.syncIndexes(), errors);
+    await runMaintenanceTask('login throttle index sync', () => LoginThrottle.syncIndexes(), errors);
+    await runMaintenanceTask(
+      'api rate limit bucket index sync',
+      () => ApiRateLimitBucket.syncIndexes(),
+      errors
+    );
+
+    startupMaintenanceState.activeTask = '';
+    startupMaintenanceState.completedAt = Date.now();
+    startupMaintenanceState.error = errors.join(' | ');
+    startupMaintenanceState.status = errors.length ? 'error' : 'ok';
+
+    if (errors.length) {
+      console.error(
+        'Startup maintenance completed with non-fatal errors:',
+        startupMaintenanceState.error
+      );
+    }
+
+    return buildStartupMaintenanceSnapshot();
+  })().finally(() => {
+    startupMaintenancePromise = undefined;
+  });
+
+  return startupMaintenancePromise;
+};
+
 app.get('/api/health', (req, res) => {
   const dbConnected = mongoose.connection.readyState === 1;
   const status = dbConnected ? 200 : 503;
@@ -321,6 +449,7 @@ app.get('/api/health', (req, res) => {
     service: config.appName,
     status: dbConnected ? 'ok' : 'degraded',
     timestamp: new Date().toISOString(),
+    maintenance: buildStartupMaintenanceSnapshot(),
   });
 });
 
@@ -377,22 +506,22 @@ const startServer = async () => {
   try {
     await connectToDatabase();
     console.log('MongoDB connected');
-    await migrateUsersToLatestIdentity({ logger: console });
-    await migrateUsersToLatestSecurityState({ logger: console });
-    await dedupePasskeysAcrossUsers({ logger: console });
-    await Promise.all([
-      User.syncIndexes(),
-      LoginThrottle.syncIndexes(),
-      ApiRateLimitBucket.syncIndexes(),
-    ]);
   } catch (err) {
     console.error('Server startup failed:', err);
     process.exit(1);
   }
 
   const hasHttpsFiles = fs.existsSync(config.httpsKeyPath) && fs.existsSync(config.httpsCertPath);
+  const transport = selectServerTransport(config.httpsMode, hasHttpsFiles);
 
-  if (hasHttpsFiles) {
+  if (config.httpsMode === 'on' && !hasHttpsFiles) {
+    console.error(
+      `HTTPS_MODE=on requires readable cert files at ${config.httpsKeyPath} and ${config.httpsCertPath}.`
+    );
+    process.exit(1);
+  }
+
+  if (transport === 'https') {
     const privateKey = fs.readFileSync(config.httpsKeyPath, 'utf8');
     const certificate = fs.readFileSync(config.httpsCertPath, 'utf8');
     server = https.createServer({ key: privateKey, cert: certificate }, app);
@@ -400,6 +529,7 @@ const startServer = async () => {
       server.listen(config.port, config.host, resolve);
     });
     console.log(`Auth service HTTPS running on https://${config.host}:${config.port}`);
+    void runStartupMaintenance();
     return server;
   }
 
@@ -408,6 +538,7 @@ const startServer = async () => {
     server.listen(config.port, config.host, resolve);
   });
   console.log(`Auth service HTTP running on http://${config.host}:${config.port}`);
+  void runStartupMaintenance();
   return server;
 };
 
@@ -443,7 +574,11 @@ module.exports = {
   app,
   config,
   connectToDatabase,
+  resolveHttpsMode,
+  runStartupMaintenance,
+  selectServerTransport,
   startServer,
+  startupMaintenanceState,
   stopServer,
 };
 

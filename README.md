@@ -76,9 +76,11 @@ Required:
 Common production settings:
 
 - `NODE_ENV=production`
+- `HOST=0.0.0.0` unless you intentionally want loopback-only binding
 - `TRUST_PROXY=1` when running behind Nginx, Caddy, or another reverse proxy
 - `ALLOWED_ORIGINS=https://dashboard.example.com,https://login.example.com`
 - `ALLOW_LOCALHOST_ORIGINS=false`
+- `HTTPS_MODE=off` when TLS terminates at the proxy, or `HTTPS_MODE=on` for direct TLS on the Node process
 
 Auth tuning:
 
@@ -168,11 +170,13 @@ Notes:
 
 - `compose.yml` expects `backend/.env` to exist.
 - The compose stack sets `MONGO_URI` to the bundled `mongo` service automatically.
-- Update `ALLOWED_ORIGINS`, `JWT_SECRET`, `REFRESH_TOKEN_SECRET`, email settings, OAuth secrets, and WebAuthn config before using the stack outside local testing.
+- The checked-in compose stack is for local development: it binds the backend on `0.0.0.0`, keeps `NODE_ENV=development`, and disables direct HTTPS on the Node process.
+- For a public/containerized deployment, switch to `NODE_ENV=production`, replace the placeholder secrets, set the correct `ALLOWED_ORIGINS`, and either terminate TLS at the proxy with `HTTPS_MODE=off` or run direct TLS with `HTTPS_MODE=on`.
 
 ## Production Notes
 
 - The repo currently ships deployment automation for the static frontend and a local deploy helper for the backend at `backend/deploy-backend.sh`.
+- The backend no longer auto-enables HTTPS just because cert files happen to exist on the host. Set `HTTPS_MODE=on` explicitly when you want the Node process itself to serve TLS.
 - The backend workflow runs `npm run check` and `npm test`; it still does not deploy or validate production secrets.
 - The dashboard and login popup now expose Microsoft alongside GitHub, Google, and Discord when the provider is configured on the backend.
 - Passkeys and cross-site refresh cookies depend on your final public origins, proxy setup, and HTTPS configuration, so validate those flows in the deployed environment instead of assuming local success maps to production.

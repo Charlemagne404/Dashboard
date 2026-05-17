@@ -31,6 +31,16 @@ log() {
   printf '[deploy] %s\n' "$*"
 }
 
+try_health_url() {
+  local url="$1"
+  log "Verifying health at $url"
+  if [[ "$url" == https://* ]]; then
+    curl -kfsS "$url"
+  else
+    curl -fsS "$url"
+  fi
+}
+
 fail() {
   printf '[deploy] ERROR: %s\n' "$*" >&2
   exit 1
@@ -105,9 +115,13 @@ systemctl --user restart "$SERVICE_NAME"
 log "Checking service status"
 systemctl --user status "$SERVICE_NAME" --no-pager
 
-log "Verifying health at $HEALTH_URL"
-curl -fsS "$HEALTH_URL"
-printf '\n'
+if try_health_url "$HEALTH_URL"; then
+  printf '\n'
+elif [[ "$HEALTH_URL" == "http://127.0.0.1:5000/api/health" ]] && try_health_url "https://127.0.0.1:5000/api/health"; then
+  printf '\n'
+else
+  fail "Health check failed."
+fi
 
 if [[ -n "$stash_name" ]]; then
   log "Local changes were stashed as $stash_name"

@@ -284,8 +284,25 @@ const parseActivityDayStart = (value) => {
 const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const getRequestOrigin = (req) => {
-  const forwardedProto = sanitizeText(req.headers['x-forwarded-proto'], 20).toLowerCase();
-  const protocol = forwardedProto || (req.secure ? 'https' : 'http');
+  const forwardedProto = sanitizeText(
+    String(req.headers['x-forwarded-proto'] || '').split(',')[0],
+    20
+  ).toLowerCase();
+  const browserOrigin = extractBrowserOrigin(req);
+  let protocol = forwardedProto || (req.secure ? 'https' : '');
+
+  if (!protocol && browserOrigin) {
+    try {
+      protocol = new URL(browserOrigin).protocol.replace(':', '').toLowerCase();
+    } catch {
+      protocol = '';
+    }
+  }
+
+  if (!protocol) {
+    protocol = 'http';
+  }
+
   const host = sanitizeText(req.headers['x-forwarded-host'] || req.headers.host, 200);
 
   if (!host) return '';
@@ -3372,7 +3389,7 @@ const normalizePreferences = (incoming = {}, current = {}) => {
 };
 
 const buildCookieOptions = (req) => {
-  const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const isSecure = getRequestOrigin(req).startsWith('https://');
   const isCrossSite = isSecure && !isSameSiteRequest(req);
 
   return {
