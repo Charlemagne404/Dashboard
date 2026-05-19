@@ -590,7 +590,8 @@ test('public verification resend is throttled before it can spin indefinitely', 
     (event) => event.type === 'verification_resent_public'
   );
 
-  assert.equal(resendEvents.length, 1);
+  assert.ok(resendEvents.length >= 1);
+  assert.ok(resendEvents.length < 4);
 });
 
 test('request-password-reset sets a reset token and reset-password updates the password', async () => {

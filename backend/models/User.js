@@ -269,6 +269,8 @@ const userSchema = new mongoose.Schema(
     },
     security: {
       loginAlerts: { type: Boolean, default: true },
+      loginAlertLastSentAt: { type: Date, default: null },
+      loginAlertLastDeviceFingerprint: { type: String, default: '', trim: true, maxlength: 128 },
       passwordChangedAt: { type: Date, default: null },
       mfa: {
         enabled: { type: Boolean, default: false },

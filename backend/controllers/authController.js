@@ -96,6 +96,8 @@ const PASSWORD_RESET_EMAIL_COOLDOWN_MS =
   Number(process.env.PASSWORD_RESET_EMAIL_COOLDOWN_MS) || 10 * 60 * 1000;
 const VERIFICATION_EMAIL_COOLDOWN_MS =
   Number(process.env.VERIFICATION_EMAIL_COOLDOWN_MS) || 30 * 60 * 1000;
+const LOGIN_ALERT_EMAIL_COOLDOWN_MS =
+  Number(process.env.LOGIN_ALERT_EMAIL_COOLDOWN_MS) || 12 * 60 * 60 * 1000;
 const RETURNING_ACCOUNT_INACTIVE_DAYS =
   Number(process.env.RETURNING_ACCOUNT_INACTIVE_DAYS) || 120;
 const RETURNING_ACCOUNT_PASSWORD_REVIEW_DAYS =
@@ -2437,6 +2439,26 @@ const shouldSendLoginAlert = (user) =>
   shouldSendSecurityNotifications(user) &&
   Boolean(hasOwn(user?.security || {}, 'loginAlerts') ? user?.security?.loginAlerts : true);
 
+const shouldSendLoginAlertForDevice = (user, deviceFingerprint = '') => {
+  if (!shouldSendLoginAlert(user)) {
+    return false;
+  }
+
+  const lastSentAt = user?.security?.loginAlertLastSentAt
+    ? new Date(user.security.loginAlertLastSentAt).getTime()
+    : 0;
+  const cooldownActive =
+    lastSentAt > 0 && lastSentAt + LOGIN_ALERT_EMAIL_COOLDOWN_MS > Date.now();
+  const normalizedFingerprint = sanitizeText(deviceFingerprint, 128);
+  const lastFingerprint = sanitizeText(user?.security?.loginAlertLastDeviceFingerprint, 128);
+
+  if (!cooldownActive) {
+    return true;
+  }
+
+  return Boolean(normalizedFingerprint && lastFingerprint && normalizedFingerprint !== lastFingerprint);
+};
+
 const sendSecurityAlertEmail = async (user, subject, title, intro, details = [], options = {}) => {
   const recipient = sanitizeText(options.emailOverride || user?.email, 320);
   if (!shouldSendSecurityNotifications(user, recipient)) {
@@ -2445,10 +2467,23 @@ const sendSecurityAlertEmail = async (user, subject, title, intro, details = [],
 
   const emailContent = buildSecurityEmailContent({ user, title, intro, details });
   return deliverManagedEmail({
+    user,
     to: recipient,
     subject,
     text: emailContent.text,
     html: emailContent.html,
+    onSent: () => {
+      if (!options.trackLoginAlert) {
+        return;
+      }
+
+      user.security = user.security || {};
+      user.security.loginAlertLastSentAt = new Date();
+      user.security.loginAlertLastDeviceFingerprint = sanitizeText(
+        options.deviceFingerprint,
+        128
+      );
+    },
   });
 };
 
@@ -3388,9 +3423,31 @@ const normalizePreferences = (incoming = {}, current = {}) => {
   };
 };
 
+const resolveCookieDomain = (req) => {
+  const configuredDomain = sanitizeText(process.env.COOKIE_DOMAIN, 255).replace(/^\.+/, '');
+  if (configuredDomain) {
+    return configuredDomain;
+  }
+
+  const requestOrigin = getRequestOrigin(req);
+  if (!requestOrigin) return '';
+
+  try {
+    const hostname = new URL(requestOrigin).hostname.toLowerCase();
+    if (hostname === 'continental-hub.com' || hostname.endsWith('.continental-hub.com')) {
+      return 'continental-hub.com';
+    }
+  } catch {
+    return '';
+  }
+
+  return '';
+};
+
 const buildCookieOptions = (req) => {
   const isSecure = getRequestOrigin(req).startsWith('https://');
   const isCrossSite = isSecure && !isSameSiteRequest(req);
+  const domain = resolveCookieDomain(req);
 
   return {
     httpOnly: true,
@@ -3398,6 +3455,7 @@ const buildCookieOptions = (req) => {
     sameSite: isCrossSite ? 'None' : 'Lax',
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
+    ...(domain ? { domain } : {}),
   };
 };
 
@@ -3765,7 +3823,7 @@ const issueInteractiveSession = async (req, res, user, options = {}) => {
   const sessionTokens = createTrackedRefreshSession(user, req, deviceLabel, device.fingerprint);
   await user.save();
 
-  if (device.isNewDevice && shouldSendLoginAlert(user)) {
+  if (device.isNewDevice && shouldSendLoginAlertForDevice(user, device.fingerprint)) {
     await sendSecurityAlertEmail(
       user,
       alertTitle,
@@ -3777,7 +3835,11 @@ const issueInteractiveSession = async (req, res, user, options = {}) => {
             `Time: ${new Date().toUTCString()}`,
             `IP address: ${parseClientIp(req) || 'Unknown'}`,
             `Device: ${buildSessionLabel(deviceLabel, parseUserAgent(req))}`,
-          ]
+          ],
+      {
+        trackLoginAlert: true,
+        deviceFingerprint: device.fingerprint,
+      }
     );
   }
 
