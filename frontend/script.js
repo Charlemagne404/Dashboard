@@ -736,7 +736,7 @@ const ensureApiBaseUrl = async () => {
 
 const getDefaultLoginPopupUrl = () => {
   if (LOCAL_HOSTS.has(window.location.hostname)) {
-    return new URL('../login popup/popup.html', window.location.href).toString();
+    return new URL('./login/popup.html', window.location.href).toString();
   }
 
   return 'https://login.continental-hub.com/popup.html';

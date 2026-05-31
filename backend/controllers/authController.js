@@ -570,6 +570,19 @@ const resolveTrustedOauthAppOrigin = (value, fallback = DEFAULT_DASHBOARD_ORIGIN
   return getDefaultTrustedOauthAppOrigin();
 };
 
+const resolveTrustedOauthOriginFromRedirect = (value) => {
+  const redirectUrl = sanitizeText(value, 4000);
+  if (!redirectUrl) {
+    return '';
+  }
+
+  try {
+    return resolveTrustedOauthAppOrigin(new URL(redirectUrl).origin, '');
+  } catch {
+    return '';
+  }
+};
+
 const resolveTrustedOauthRedirectUrl = (value, fallbackOrigin = DEFAULT_DASHBOARD_ORIGIN) => {
   const safeOrigin = resolveTrustedOauthAppOrigin(
     fallbackOrigin,
@@ -6627,7 +6640,11 @@ exports.startOauthLogin = async (req, res) => {
 
   try {
     const config = getOauthProviderConfig(req.params.provider, req);
-    const targetOrigin = resolveTrustedOauthAppOrigin(req.query?.origin || DEFAULT_DASHBOARD_ORIGIN);
+    const requestedTargetOrigin =
+      req.query?.origin || resolveTrustedOauthOriginFromRedirect(req.query?.redirect);
+    const targetOrigin = resolveTrustedOauthAppOrigin(
+      requestedTargetOrigin || DEFAULT_DASHBOARD_ORIGIN
+    );
     if (!targetOrigin) {
       throw createHttpError(503, 'OAuth app origins are not configured on this server.');
     }
@@ -6651,7 +6668,10 @@ exports.startOauthLogin = async (req, res) => {
           title: `${providerLabel} sign-in unavailable`,
           message: err.message,
           redirectUrl: resolveTrustedOauthRedirectUrl(req.query?.returnTo || req.query?.redirect),
-          targetOrigin: resolveTrustedOauthAppOrigin(req.query?.origin || ''),
+          targetOrigin: resolveTrustedOauthAppOrigin(
+            req.query?.origin || resolveTrustedOauthOriginFromRedirect(req.query?.redirect),
+            ''
+          ),
           closeWindow: false,
         })
       );
@@ -6662,7 +6682,10 @@ exports.startOauthLogin = async (req, res) => {
         title: `${providerLabel} sign-in unavailable`,
         message: `Could not start ${providerLabel} sign-in.`,
         redirectUrl: resolveTrustedOauthRedirectUrl(req.query?.returnTo || req.query?.redirect),
-        targetOrigin: resolveTrustedOauthAppOrigin(req.query?.origin || ''),
+        targetOrigin: resolveTrustedOauthAppOrigin(
+          req.query?.origin || resolveTrustedOauthOriginFromRedirect(req.query?.redirect),
+          ''
+        ),
         closeWindow: false,
       })
     );

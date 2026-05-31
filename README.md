@@ -149,6 +149,7 @@ Optional runtime globals:
 Default behavior now assumes the frontend and `/api/*` are available on the same HTTPS origin. That is the preferred deployment because it avoids exposing `:5000` to browsers and reduces cross-site cookie failures on restrictive networks.
 For the current hosted static domains (`dashboard.continental-hub.com`, `login.continental-hub.com`, `pulse.continental-hub.com`, `grimoire.continental-hub.com`, and `charlemagne404.github.io`), the checked-in frontend now probes the same origin plus the known Continental auth/API hosts and only keeps a candidate that exposes the expected auth `/api/health` response. Set `window.__API_BASE_URL__` when you want a deterministic backend origin.
 For the operational integration rules, popup contract, redirect fallback, and deployment checklist, see [docs/continental-id-integration.md](docs/continental-id-integration.md).
+The hosted Continental ID login pages now live in `frontend/login/` inside this repo and are the canonical source for `login.continental-hub.com`.
 
 ## GitHub Pages Hosting
 
@@ -158,7 +159,13 @@ For the operational integration rules, popup contract, redirect fallback, and de
 - In your GitHub repo settings, set Pages to **GitHub Actions** as the source.
 - If your API is on a different origin, set backend `ALLOWED_ORIGINS` to include your Pages/custom domain.
 - If you proxy the API through the same public host on `443`, leave the frontend on its default same-origin `/api/*` setup instead of pointing browsers at `:5000`.
-- To mirror the auth pages into the sibling `Login` repo, run `bash scripts/sync-login-popup.sh`.
+
+## Login Site Hosting
+
+- The canonical hosted login site now lives at `frontend/login/`.
+- Point `login.continental-hub.com` at the server that runs Caddy instead of GitHub Pages before cutting over.
+- Use `deploy/install-login-hosting.sh` on the server to publish those files to `/var/www/continental-id-login` and install the `login.continental-hub.com` Caddy block from `deploy/Caddyfile.login`.
+- The login site proxies `/api/health`, `/api/auth/*`, and `/api/grimoire/*` to the local Continental ID backend on `127.0.0.1:5000`.
 
 ## Container Setup
 
@@ -178,7 +185,7 @@ Notes:
 
 ## Production Notes
 
-- The repo currently ships deployment automation for the static frontend and a local deploy helper for the backend at `backend/deploy-backend.sh`.
+- The repo currently ships deployment automation for the dashboard frontend, the hosted login frontend, and a local deploy helper for the backend at `backend/deploy-backend.sh`.
 - The backend no longer auto-enables HTTPS just because cert files happen to exist on the host. Set `HTTPS_MODE=on` explicitly when you want the Node process itself to serve TLS.
 - The backend workflow runs `npm run check` and `npm test`; it still does not deploy or validate production secrets.
 - The dashboard and login popup now expose Microsoft alongside GitHub, Google, and Discord when the provider is configured on the backend.

@@ -80,9 +80,9 @@ test('hosted frontend probes only accept healthy auth API responses', () => {
   const probeFiles = [
     path.join(repoRoot, 'frontend/script.js'),
     path.join(repoRoot, 'frontend/profile.html'),
-    path.join(repoRoot, 'login popup/popup.js'),
-    path.join(repoRoot, 'login popup/reset-password.js'),
-    path.join(repoRoot, 'login popup/verify.js'),
+    path.join(repoRoot, 'frontend/login/popup.js'),
+    path.join(repoRoot, 'frontend/login/reset-password.js'),
+    path.join(repoRoot, 'frontend/login/verify.js'),
   ];
 
   for (const filePath of probeFiles) {
@@ -90,4 +90,24 @@ test('hosted frontend probes only accept healthy auth API responses', () => {
     assert.doesNotMatch(source, /\['ok',\s*'degraded'\]\.includes\(status\)/);
     assert.match(source, /\['ok'\]\.includes\(status\)/);
   }
+});
+
+test('hosted login popup can recover the caller origin from redirect urls', () => {
+  const popupSource = fs.readFileSync(path.join(repoRoot, 'frontend/login/popup.js'), 'utf8');
+
+  assert.match(popupSource, /resolveTrustedOrigin\(params\.get\('redirect'\)\)/);
+});
+
+test('login site is hosted from the continental id repo and exposes a local install path', () => {
+  const installScriptSource = fs.readFileSync(
+    path.join(repoRoot, 'deploy/install-login-hosting.sh'),
+    'utf8'
+  );
+  const caddyBlockSource = fs.readFileSync(path.join(repoRoot, 'deploy/Caddyfile.login'), 'utf8');
+
+  assert.match(installScriptSource, /frontend\/login/);
+  assert.match(installScriptSource, /login\.continental-hub\.com/);
+  assert.match(caddyBlockSource, /login\.continental-hub\.com/);
+  assert.match(caddyBlockSource, /root \* \/var\/www\/continental-id-login/);
+  assert.match(caddyBlockSource, /reverse_proxy 127\.0\.0\.1:5000/);
 });

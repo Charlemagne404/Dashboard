@@ -16,6 +16,8 @@ process.env.REFRESH_TOKEN_SECRET =
   process.env.REFRESH_TOKEN_SECRET || 'test-refresh-secret-12345678901234567890';
 process.env.ALLOW_LOCALHOST_ORIGINS = 'true';
 process.env.TRUST_PROXY = '1';
+process.env.GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || 'github-client-id-test';
+process.env.GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || 'github-client-secret-test';
 
 const { app } = require('../server');
 const User = require('../models/User');
@@ -81,7 +83,7 @@ test.beforeEach(async () => {
 });
 
 test('Terra-Treck GitHub Pages origin is trusted by hosted popup config and backend CORS', async () => {
-  const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
+  const popupConfigPath = path.resolve(__dirname, '../../frontend/login/auth-config.js');
   const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
 
   assert.match(popupConfigSource, /https:\/\/charlemagne404\.github\.io/);
@@ -98,7 +100,7 @@ test('Terra-Treck GitHub Pages origin is trusted by hosted popup config and back
 });
 
 test('Pulse hosted origin is trusted by popup config and can complete the refresh-cookie flow', async () => {
-  const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
+  const popupConfigPath = path.resolve(__dirname, '../../frontend/login/auth-config.js');
   const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
   const popupScriptPath = path.resolve(__dirname, '../../login popup/popup.js');
   const popupScriptSource = fs.readFileSync(popupScriptPath, 'utf8');
@@ -154,7 +156,7 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
 });
 
 test('Blueprint hosted origin is trusted consistently by popup config and backend CORS', async () => {
-  const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
+  const popupConfigPath = path.resolve(__dirname, '../../frontend/login/auth-config.js');
   const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
 
   assert.match(popupConfigSource, /https:\/\/blueprint\.continental-hub\.com/);
@@ -180,6 +182,29 @@ test('Dashboard hosted origin remains trusted by backend CORS', async () => {
   assert.equal(preflightResponse.status, 204);
   assert.equal(preflightResponse.headers['access-control-allow-origin'], DASHBOARD_ORIGIN);
   assert.equal(preflightResponse.headers['access-control-allow-credentials'], 'true');
+});
+
+test('oauth login start recovers Pulse as the target origin from redirect when origin is omitted', async () => {
+  const pulseRedirectUrl = `${PULSE_ORIGIN}/dashboard`;
+  const response = await request(app)
+    .get('/api/auth/oauth/github/start')
+    .query({
+      redirect: pulseRedirectUrl,
+    });
+
+  assert.equal(response.status, 302);
+  const location = response.headers.location;
+  assert.ok(location);
+
+  const authorizeUrl = new URL(location);
+  assert.equal(authorizeUrl.origin, 'https://github.com');
+
+  const stateToken = authorizeUrl.searchParams.get('state');
+  assert.ok(stateToken);
+
+  const statePayload = jwt.decode(stateToken);
+  assert.equal(statePayload?.targetOrigin, PULSE_ORIGIN);
+  assert.equal(statePayload?.redirectUrl, pulseRedirectUrl);
 });
 
 test('register creates an unverified account and blocks login until verification', async () => {
