@@ -255,6 +255,14 @@ const requireTrustedBrowserOrigin = (req, res, next) => {
   }
 
   return res.status(403).json({
+    authenticated: false,
+    correlationId: req.requestId,
+    error: {
+      code: 'auth/origin-rejected',
+      correlationId: req.requestId,
+      message: 'Trusted browser origin required.',
+      retryable: false,
+    },
     message: 'Trusted browser origin required.',
     requestId: req.requestId,
   });

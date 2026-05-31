@@ -148,6 +148,7 @@ Optional runtime globals:
 
 Default behavior now assumes the frontend and `/api/*` are available on the same HTTPS origin. That is the preferred deployment because it avoids exposing `:5000` to browsers and reduces cross-site cookie failures on restrictive networks.
 For the current hosted static domains (`dashboard.continental-hub.com`, `login.continental-hub.com`, `pulse.continental-hub.com`, `grimoire.continental-hub.com`, and `charlemagne404.github.io`), the checked-in frontend now probes the same origin plus the known Continental auth/API hosts and only keeps a candidate that exposes the expected auth `/api/health` response. Set `window.__API_BASE_URL__` when you want a deterministic backend origin.
+For the operational integration rules, popup contract, redirect fallback, and deployment checklist, see [docs/continental-id-integration.md](docs/continental-id-integration.md).
 
 ## GitHub Pages Hosting
 

@@ -10,6 +10,9 @@ const PREFERRED_API_ORIGINS = Array.isArray(AUTH_CONFIG.preferredApiOrigins)
 const HOSTED_API_BASE_URL =
   AUTH_CONFIG.hostedApiBaseUrl || 'https://auth.continental-hub.com';
 const API_BASE_STORAGE_KEY = 'continental.authApiBaseUrl';
+const AUTH_RESULT_MARKER_KEY = 'continentalAuth';
+const AUTH_POPUP_MESSAGE_SOURCE = 'continental-id';
+const AUTH_POPUP_MESSAGE_TYPE = 'auth-result';
 const OAUTH_PROVIDERS = ['github', 'google', 'discord', 'microsoft'];
 const USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{1,28}[A-Za-z0-9])?$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -353,6 +356,44 @@ const getRedirectUrl = () => {
   return redirectUrl.toString();
 };
 
+const buildAuthRedirectUrl = (payload) => {
+  const redirectUrl = new URL(getRedirectUrl());
+  const hashParams = new URLSearchParams(redirectUrl.hash.replace(/^#/, ''));
+  const accessToken = safeText(payload?.accessToken || payload?.token);
+  const apiBaseUrl =
+    trimTrailingSlash(API_BASE_URL) || resolveTrustedApiBaseUrl(params.get('apiBaseUrl'));
+  const authEvent = safeText(payload?.event) || (accessToken ? 'login_success' : 'login_error');
+  const authCode = safeText(payload?.code || payload?.error?.code);
+  const authMessage = safeText(payload?.message || payload?.error?.message);
+  const correlationId = safeText(payload?.correlationId || payload?.requestId);
+  const provider = safeText(payload?.provider);
+
+  hashParams.set(AUTH_RESULT_MARKER_KEY, '1');
+  hashParams.set('authEvent', authEvent);
+  if (accessToken) {
+    hashParams.set('accessToken', accessToken);
+    hashParams.set('token', accessToken);
+  }
+  if (apiBaseUrl) {
+    hashParams.set('apiBaseUrl', apiBaseUrl);
+  }
+  if (authCode) {
+    hashParams.set('authCode', authCode);
+  }
+  if (authMessage) {
+    hashParams.set('authMessage', authMessage);
+  }
+  if (correlationId) {
+    hashParams.set('correlationId', correlationId);
+  }
+  if (provider) {
+    hashParams.set('provider', provider);
+  }
+
+  redirectUrl.hash = hashParams.toString();
+  return redirectUrl.toString();
+};
+
 const getOauthProviderLabel = (provider) => {
   const normalized = safeText(provider).toLowerCase();
   if (normalized === 'github') return 'GitHub';
@@ -462,22 +503,44 @@ const setBusy = (button, busy, idleLabel, busyLabel) => {
 };
 
 const finishAuth = (payload) => {
+  const messagePayload = {
+    source: AUTH_POPUP_MESSAGE_SOURCE,
+    type: AUTH_POPUP_MESSAGE_TYPE,
+    legacyType: 'LOGIN_SUCCESS',
+    event: 'login_success',
+    accessToken: safeText(payload?.accessToken || payload?.token),
+    token: safeText(payload?.accessToken || payload?.token),
+    correlationId: safeText(payload?.correlationId || payload?.requestId),
+    message: safeText(payload?.message),
+    provider: safeText(payload?.provider).toLowerCase(),
+    user: payload?.user || null,
+    apiBaseUrl: trimTrailingSlash(API_BASE_URL),
+  };
+  const authRedirectUrl = buildAuthRedirectUrl(payload);
+
   if (window.opener && !window.opener.closed && targetOrigin) {
-    window.opener.postMessage(
-      {
-        type: 'LOGIN_SUCCESS',
-        accessToken: safeText(payload?.accessToken || payload?.token),
-        token: safeText(payload?.accessToken || payload?.token),
-        user: payload?.user || null,
-        apiBaseUrl: trimTrailingSlash(API_BASE_URL),
-      },
-      targetOrigin
-    );
-    window.close();
-    return;
+    try {
+      window.opener.postMessage(messagePayload, targetOrigin);
+      window.setTimeout(() => {
+        try {
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage(messagePayload, targetOrigin);
+          }
+        } catch {
+          // Ignore secondary opener failures and fall back to redirect.
+        }
+      }, 80);
+      window.setTimeout(() => window.close(), 140);
+      window.setTimeout(() => {
+        window.location.replace(authRedirectUrl);
+      }, 260);
+      return;
+    } catch {
+      // Fall through to the redirect-based recovery path.
+    }
   }
 
-  window.location.href = getRedirectUrl();
+  window.location.replace(authRedirectUrl);
 };
 
 const parseJson = async (res) => {

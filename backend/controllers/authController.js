@@ -203,6 +203,28 @@ const OAUTH_APP_ORIGINS = new Set([
 const DEFAULT_LOGIN_POPUP_URL = `${DEFAULT_LOGIN_ORIGIN}/popup.html`;
 const DEFAULT_EMAIL_VERIFY_PATH = '/verify.html';
 const DEFAULT_PASSWORD_RESET_PATH = '/reset-password.html';
+const AUTH_RESULT_MARKER_KEY = 'continentalAuth';
+const AUTH_POPUP_MESSAGE_SOURCE = 'continental-id';
+const AUTH_POPUP_MESSAGE_TYPE = 'auth-result';
+const AUTH_ERROR_CODE = {
+  accessTokenMissing: 'auth/access-token-missing',
+  authorizationDenied: 'auth/authorization-denied',
+  emailUnverified: 'auth/email-unverified',
+  identityConflict: 'auth/identity-conflict',
+  invalidCredentials: 'auth/invalid-credentials',
+  invalidRefreshSession: 'auth/invalid-refresh-session',
+  invalidToken: 'auth/invalid-token',
+  mfaBlocked: 'auth/mfa-blocked',
+  mfaRequired: 'auth/mfa-required',
+  originRejected: 'auth/origin-rejected',
+  popupMessageRejected: 'auth/popup-message-rejected',
+  refreshSessionMissing: 'auth/refresh-session-missing',
+  registrationFailed: 'auth/registration-failed',
+  sessionRevoked: 'auth/session-revoked',
+  suspended: 'auth/account-suspended',
+  unavailable: 'auth/unavailable',
+  userNotFound: 'auth/user-not-found',
+} ;
 const EMAIL_VERIFICATION_SUBJECT = 'Verify your Continental ID email';
 const PASSWORD_RESET_SUBJECT = 'Reset your Continental ID password';
 const AVATAR_DATA_URL_MAX_LENGTH = 350000;
@@ -565,6 +587,113 @@ const resolveTrustedOauthRedirectUrl = (value, fallbackOrigin = DEFAULT_DASHBOAR
     return resolved.toString();
   } catch {
     return new URL('/', safeOrigin).toString();
+  }
+};
+
+const buildAuthResultMessagePayload = (
+  req,
+  {
+    accessToken = '',
+    apiBaseUrl = '',
+    code = '',
+    event = 'login_success',
+    message = '',
+    provider = '',
+    user = null,
+  } = {}
+) => {
+  const normalizedEvent = sanitizeText(event, 80) || 'login_success';
+  const token = sanitizeText(accessToken, 4000);
+  const correlationId = sanitizeText(req?.requestId, 120);
+  const messagePayload = {
+    source: AUTH_POPUP_MESSAGE_SOURCE,
+    type: AUTH_POPUP_MESSAGE_TYPE,
+    event: normalizedEvent,
+    correlationId,
+  };
+
+  const normalizedCode = sanitizeText(code, 120);
+  const normalizedMessage = sanitizeText(message, 400);
+  const normalizedProvider = sanitizeText(provider, 80).toLowerCase();
+  const normalizedApiBaseUrl = sanitizeText(apiBaseUrl, 2000);
+
+  if (normalizedCode) messagePayload.code = normalizedCode;
+  if (normalizedMessage) messagePayload.message = normalizedMessage;
+  if (normalizedProvider) messagePayload.provider = normalizedProvider;
+  if (normalizedApiBaseUrl) messagePayload.apiBaseUrl = normalizedApiBaseUrl;
+
+  if (normalizedEvent === 'login_success') {
+    messagePayload.legacyType = 'LOGIN_SUCCESS';
+    if (token) {
+      messagePayload.accessToken = token;
+      messagePayload.token = token;
+    }
+    if (user) {
+      messagePayload.user = user;
+    }
+  } else if (normalizedEvent === 'oauth_linked') {
+    messagePayload.legacyType = 'OAUTH_LINKED';
+  } else if (normalizedEvent === 'login_error') {
+    messagePayload.legacyType = 'LOGIN_ERROR';
+    if (normalizedMessage) {
+      messagePayload.error = normalizedMessage;
+    }
+  }
+
+  return messagePayload;
+};
+
+const appendAuthPayloadToRedirectUrl = (redirectUrl, messagePayload) => {
+  const token = sanitizeText(messagePayload?.accessToken || messagePayload?.token, 4000);
+  const apiBaseUrl = sanitizeText(messagePayload?.apiBaseUrl, 2000);
+  const authEvent =
+    sanitizeText(messagePayload?.event, 120) ||
+    (sanitizeText(messagePayload?.type, 120) === 'LOGIN_SUCCESS'
+      ? 'login_success'
+      : sanitizeText(messagePayload?.type, 120) === 'LOGIN_ERROR'
+        ? 'login_error'
+        : sanitizeText(messagePayload?.type, 120) === 'OAUTH_LINKED'
+          ? 'oauth_linked'
+          : '');
+  const code = sanitizeText(messagePayload?.code, 120);
+  const message = sanitizeText(messagePayload?.message || messagePayload?.error, 400);
+  const correlationId = sanitizeText(messagePayload?.correlationId, 120);
+  const provider = sanitizeText(messagePayload?.provider, 80).toLowerCase();
+
+  if (!authEvent || (!token && !apiBaseUrl && !code && !message)) {
+    return redirectUrl;
+  }
+
+  try {
+    const resolved = new URL(String(redirectUrl || DEFAULT_DASHBOARD_ORIGIN));
+    const hashParams = new URLSearchParams(resolved.hash.replace(/^#/, ''));
+
+    hashParams.set(AUTH_RESULT_MARKER_KEY, '1');
+    hashParams.set('authEvent', authEvent);
+    if (token) {
+      hashParams.set('accessToken', token);
+      hashParams.set('token', token);
+    }
+    if (apiBaseUrl) {
+      hashParams.set('apiBaseUrl', apiBaseUrl);
+    }
+    if (code) {
+      hashParams.set('authCode', code);
+    }
+    if (message) {
+      hashParams.set('authMessage', message);
+    }
+    if (correlationId) {
+      hashParams.set('correlationId', correlationId);
+    }
+    if (provider) {
+      hashParams.set('provider', provider);
+    }
+
+    resolved.hash = hashParams.toString();
+    return resolved.toString();
+  } catch {
+    return redirectUrl;
   }
 };
 
@@ -1143,6 +1272,7 @@ const renderOauthResultPage = ({
   const helperList = helperItems
     .map((item, index) => `<li><span>${index + 1}</span><p>${escapeHtml(item)}</p></li>`)
     .join('');
+  const resolvedRedirectUrl = appendAuthPayloadToRedirectUrl(redirectUrl, messagePayload);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1456,7 +1586,7 @@ const renderOauthResultPage = ({
         </section>
 
         <div class="actions">
-          <a id="continue-link" class="primary" href="${escapeHtml(redirectUrl)}">${escapeHtml(primaryLabel)}</a>
+          <a id="continue-link" class="primary" href="${escapeHtml(resolvedRedirectUrl)}">${escapeHtml(primaryLabel)}</a>
           <button id="close-window-btn" class="secondary" type="button">Close this window</button>
         </div>
 
@@ -1472,7 +1602,7 @@ const renderOauthResultPage = ({
   <script>
     const payload = ${JSON.stringify(messagePayload || null)};
     const targetOrigin = ${JSON.stringify(targetOrigin || '')};
-    const redirectUrl = ${JSON.stringify(redirectUrl)};
+    const redirectUrl = ${JSON.stringify(resolvedRedirectUrl)};
     const closeWindow = ${JSON.stringify(Boolean(closeWindow))};
     const redirectDelayMs = ${JSON.stringify(redirectDelayMs)};
     const countdownEl = document.getElementById('redirect-countdown');
@@ -1519,13 +1649,32 @@ const renderOauthResultPage = ({
     }
 
     if (payload && window.opener && !window.opener.closed && targetOrigin) {
-      window.opener.postMessage(payload, targetOrigin);
-      if (closeWindow) {
-        if (redirectCopyEl) {
-          redirectCopyEl.textContent = 'Sign-in complete. Closing this window.';
+      try {
+        window.opener.postMessage(payload, targetOrigin);
+        window.setTimeout(() => {
+          try {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage(payload, targetOrigin);
+            }
+          } catch {
+            // Ignore retry failures and fall back to redirect handling.
+          }
+        }, 80);
+        if (closeWindow) {
+          if (redirectCopyEl) {
+            redirectCopyEl.textContent = 'Sign-in complete. Closing this window.';
+          }
+          window.setTimeout(closePopup, 140);
+          window.setTimeout(() => {
+            if (!hasRedirected && redirectUrl) {
+              hasRedirected = true;
+              window.location.replace(redirectUrl);
+            }
+          }, 260);
+        } else {
+          startRedirectCountdown();
         }
-        window.setTimeout(closePopup, 120);
-      } else {
+      } catch {
         startRedirectCountdown();
       }
     } else {
@@ -3856,6 +4005,13 @@ const completeInteractiveSignIn = async (res, req, user, options = {}) => {
   res.cookie('refreshToken', sessionTokens.refreshToken, buildCookieOptions(req));
 
   return sendUserResponse(res, 200, 'Login successful.', user, {
+    ...buildAuthSuccessMeta(req, {
+      popup: {
+        source: AUTH_POPUP_MESSAGE_SOURCE,
+        type: AUTH_POPUP_MESSAGE_TYPE,
+      },
+      sessionEstablished: true,
+    }),
     token: sessionTokens.accessToken,
     accessToken: sessionTokens.accessToken,
     authenticated: true,
@@ -4440,6 +4596,39 @@ const sendUserResponse = (res, status, message, user, extra = {}) => {
     user: payload,
   });
 };
+
+const buildAuthSuccessMeta = (req, extra = {}) => ({
+  auth: {
+    code: 'auth/ok',
+    correlationId: sanitizeText(req?.requestId, 120),
+    ...extra,
+  },
+  correlationId: sanitizeText(req?.requestId, 120),
+  requestId: sanitizeText(req?.requestId, 120),
+});
+
+const buildAuthErrorPayload = (
+  req,
+  {
+    authenticated = false,
+    code = AUTH_ERROR_CODE.unavailable,
+    message = 'Authentication failed.',
+    retryable = false,
+    ...extra
+  } = {}
+) => ({
+  authenticated: Boolean(authenticated),
+  correlationId: sanitizeText(req?.requestId, 120),
+  error: {
+    code: sanitizeText(code, 120) || AUTH_ERROR_CODE.unavailable,
+    correlationId: sanitizeText(req?.requestId, 120),
+    message: sanitizeText(message, 400) || 'Authentication failed.',
+    retryable: Boolean(retryable),
+  },
+  message: sanitizeText(message, 400) || 'Authentication failed.',
+  requestId: sanitizeText(req?.requestId, 120),
+  ...extra,
+});
 
 const buildActivitySummary = (recentLogins = [], dailyCounts = []) => {
   const now = Date.now();
@@ -5090,31 +5279,50 @@ exports.register = async (req, res) => {
 
   try {
     if (!isValidEmail(email)) {
-      return res.status(400).json({ message: 'Please provide a valid email address.' });
+      return res.status(400).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.registrationFailed,
+          message: 'Please provide a valid email address.',
+        })
+      );
     }
 
     if (!isStrongPassword(password)) {
-      return res.status(400).json({
-        message:
-          'Password must be at least 8 characters and include uppercase, lowercase, and a number.',
-      });
+      return res.status(400).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.registrationFailed,
+          message:
+            'Password must be at least 8 characters and include uppercase, lowercase, and a number.',
+        })
+      );
     }
 
     if (hasOwn(req.body || {}, 'username') && !normalizeUsername(requestedUsername)) {
-      return res.status(400).json({ message: USERNAME_VALIDATION_MESSAGE });
+      return res
+        .status(400)
+        .json(buildAuthErrorPayload(req, { code: AUTH_ERROR_CODE.registrationFailed, message: USERNAME_VALIDATION_MESSAGE }));
     }
 
     if (containsBlockedNameTerm(requestedUsername)) {
-      return res.status(400).json({ message: USERNAME_MODERATION_MESSAGE });
+      return res
+        .status(400)
+        .json(buildAuthErrorPayload(req, { code: AUTH_ERROR_CODE.registrationFailed, message: USERNAME_MODERATION_MESSAGE }));
     }
 
     if (hasOwn(req.body || {}, 'displayName') && containsBlockedNameTerm(req.body?.displayName)) {
-      return res.status(400).json({ message: DISPLAY_NAME_MODERATION_MESSAGE });
+      return res
+        .status(400)
+        .json(buildAuthErrorPayload(req, { code: AUTH_ERROR_CODE.registrationFailed, message: DISPLAY_NAME_MODERATION_MESSAGE }));
     }
 
     const existingUser = await User.findOne({ email }).select('_id');
     if (existingUser) {
-      return res.status(409).json({ message: 'A user with that email already exists.' });
+      return res.status(409).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.identityConflict,
+          message: 'A user with that email already exists.',
+        })
+      );
     }
 
     const user = new User({
@@ -5151,18 +5359,39 @@ exports.register = async (req, res) => {
         verificationDelivery
       ),
       authenticated: false,
+      ...buildAuthSuccessMeta(req, {
+        code: AUTH_ERROR_CODE.emailUnverified,
+        sessionEstablished: false,
+      }),
       requiresVerification: true,
       verificationEmail: serializeVerificationDelivery(verificationDelivery),
     });
   } catch (err) {
     if (err?.statusCode) {
-      return res.status(err.statusCode).json({ message: err.message });
+      return res.status(err.statusCode).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.registrationFailed,
+          message: err.message,
+          retryable: err.statusCode >= 500,
+        })
+      );
     }
     if (isDuplicateKeyError(err)) {
-      return res.status(409).json({ message: getDuplicateUserFieldMessage(err) });
+      return res.status(409).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.identityConflict,
+          message: getDuplicateUserFieldMessage(err),
+        })
+      );
     }
     console.error('Register error:', err);
-    return res.status(500).json({ message: 'Registration failed.' });
+    return res.status(500).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.registrationFailed,
+        message: 'Registration failed.',
+        retryable: true,
+      })
+    );
   }
 };
 
@@ -5177,16 +5406,24 @@ exports.login = async (req, res) => {
   let throttleKeys = buildLoginThrottleKeys({ identifier, req });
   let throttle = await getLoginThrottleState(throttleKeys);
   if (throttle.blocked) {
-    return res.status(429).json({
-      message: `Too many failed login attempts. Try again in ${throttle.retryAfterSec} seconds.`,
-      retryAfterSec: throttle.retryAfterSec,
-    });
+    return res.status(429).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.authorizationDenied,
+        message: `Too many failed login attempts. Try again in ${throttle.retryAfterSec} seconds.`,
+        retryAfterSec: throttle.retryAfterSec,
+      })
+    );
   }
 
   try {
     if ((!isValidEmail(identifier) && !isValidUsername(identifier)) || typeof password !== 'string') {
       await registerLoginFailure(throttleKeys);
-      return res.status(400).json({ message: 'Invalid credentials.' });
+      return res.status(400).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.invalidCredentials,
+          message: 'Invalid credentials.',
+        })
+      );
     }
 
     const user = await findUserByLoginIdentifier(identifier);
@@ -5194,22 +5431,35 @@ exports.login = async (req, res) => {
       throttleKeys = buildLoginThrottleKeys({ identifier, req, user });
       throttle = await getLoginThrottleState(throttleKeys);
       if (throttle.blocked) {
-        return res.status(429).json({
-          message: `Too many failed login attempts. Try again in ${throttle.retryAfterSec} seconds.`,
-          retryAfterSec: throttle.retryAfterSec,
-        });
+        return res.status(429).json(
+          buildAuthErrorPayload(req, {
+            code: AUTH_ERROR_CODE.authorizationDenied,
+            message: `Too many failed login attempts. Try again in ${throttle.retryAfterSec} seconds.`,
+            retryAfterSec: throttle.retryAfterSec,
+          })
+        );
       }
     }
 
     if (!user) {
       await registerLoginFailure(throttleKeys);
-      return res.status(400).json({ message: 'Invalid credentials.' });
+      return res.status(400).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.invalidCredentials,
+          message: 'Invalid credentials.',
+        })
+      );
     }
 
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
       await registerLoginFailure(throttleKeys);
-      return res.status(400).json({ message: 'Invalid credentials.' });
+      return res.status(400).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.invalidCredentials,
+          message: 'Invalid credentials.',
+        })
+      );
     }
 
     await ensureUserIdentityFields(user);
@@ -5218,7 +5468,12 @@ exports.login = async (req, res) => {
       await clearLoginFailures(throttleKeys);
       appendAuditEvent(user, req, 'login_blocked_suspended', 'Sign-in blocked because the account is suspended.');
       await user.save();
-      return res.status(403).json({ message: 'This account is suspended.' });
+      return res.status(403).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.suspended,
+          message: 'This account is suspended.',
+        })
+      );
     }
 
     if (!user.isVerified) {
@@ -5249,6 +5504,10 @@ exports.login = async (req, res) => {
           verificationDelivery
         ),
         authenticated: false,
+        ...buildAuthSuccessMeta(req, {
+          code: AUTH_ERROR_CODE.emailUnverified,
+          sessionEstablished: false,
+        }),
         requiresVerification: true,
         verificationEmail: serializeVerificationDelivery(verificationDelivery),
       });
@@ -5263,16 +5522,22 @@ exports.login = async (req, res) => {
         });
         await user.save();
         if (mfaResult.reason === 'blocked') {
-          return res.status(429).json({
-            message: `Too many invalid MFA attempts. Try again in ${mfaResult.retryAfterSec} seconds.`,
-            retryAfterSec: mfaResult.retryAfterSec,
-            mfaRequired: true,
-          });
+          return res.status(429).json(
+            buildAuthErrorPayload(req, {
+              code: AUTH_ERROR_CODE.mfaBlocked,
+              message: `Too many invalid MFA attempts. Try again in ${mfaResult.retryAfterSec} seconds.`,
+              mfaRequired: true,
+              retryAfterSec: mfaResult.retryAfterSec,
+            })
+          );
         }
-        return res.status(401).json({
-          message: mfaResult.reason === 'invalid' ? 'Invalid MFA code.' : 'Enter your MFA code to continue.',
-          mfaRequired: true,
-        });
+        return res.status(401).json(
+          buildAuthErrorPayload(req, {
+            code: AUTH_ERROR_CODE.mfaRequired,
+            message: mfaResult.reason === 'invalid' ? 'Invalid MFA code.' : 'Enter your MFA code to continue.',
+            mfaRequired: true,
+          })
+        );
       }
 
     }
@@ -5283,7 +5548,13 @@ exports.login = async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err);
-    return res.status(500).json({ message: 'Login failed.' });
+    return res.status(500).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.unavailable,
+        message: 'Login failed.',
+        retryable: true,
+      })
+    );
   }
 };
 
@@ -5593,13 +5864,24 @@ exports.me = async (req, res) => {
   try {
     const user = await getUserById(req.user.id);
     if (!user) {
-      return res.status(404).json({ message: 'User not found.' });
+      return res.status(404).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.userNotFound,
+          message: 'User not found.',
+        })
+      );
     }
 
-    return sendUserResponse(res, 200, 'User loaded.', user);
+    return sendUserResponse(res, 200, 'User loaded.', user, buildAuthSuccessMeta(req));
   } catch (err) {
     console.error('Fetch me error:', err);
-    return res.status(500).json({ message: 'Failed to fetch user profile.' });
+    return res.status(500).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.unavailable,
+        message: 'Failed to fetch user profile.',
+        retryable: true,
+      })
+    );
   }
 };
 
@@ -6011,24 +6293,33 @@ exports.refreshToken = async (req, res) => {
     const session = await resolveRefreshSessionFromCookie(req, res);
     if (!session?.user || session.replayDetected) {
       clearRefreshCookie(res, req);
-      return res.status(200).json({ authenticated: false, message: 'No active refresh session.' });
+      return res.status(200).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.refreshSessionMissing,
+          message: 'No active refresh session.',
+        })
+      );
     }
 
     if (!session.user.isVerified) {
       clearRefreshCookie(res, req);
-      return res.status(200).json({
-        authenticated: false,
-        requiresVerification: true,
-        message: 'Verify your email before signing in.',
-      });
+      return res.status(200).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.emailUnverified,
+          message: 'Verify your email before signing in.',
+          requiresVerification: true,
+        })
+      );
     }
 
     if (isSuspendedAccount(session.user.accountStatus)) {
       clearRefreshCookie(res, req);
-      return res.status(200).json({
-        authenticated: false,
-        message: 'This account is suspended.',
-      });
+      return res.status(200).json(
+        buildAuthErrorPayload(req, {
+          code: AUTH_ERROR_CODE.suspended,
+          message: 'This account is suspended.',
+        })
+      );
     }
 
     let tokenPair;
@@ -6045,7 +6336,11 @@ exports.refreshToken = async (req, res) => {
     res.cookie('refreshToken', tokenPair.refreshToken, buildCookieOptions(req));
 
     return res.json({
+      ...buildAuthSuccessMeta(req, {
+        sessionEstablished: true,
+      }),
       message: 'Session refreshed.',
+      authenticated: true,
       token: tokenPair.accessToken,
       accessToken: tokenPair.accessToken,
       userId: toObjectIdString(session.user._id),
@@ -6054,7 +6349,12 @@ exports.refreshToken = async (req, res) => {
   } catch (err) {
     console.error('Refresh token error:', err);
     clearRefreshCookie(res, req);
-    return res.status(200).json({ authenticated: false, message: 'Invalid refresh session.' });
+    return res.status(200).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.invalidRefreshSession,
+        message: 'Invalid refresh session.',
+      })
+    );
   }
 };
 
@@ -6478,10 +6778,11 @@ exports.finishOauthCallback = async (req, res) => {
           message: `Your ${providerLabel} account is now linked to Continental ID.`,
           redirectUrl: returnTo,
           targetOrigin,
-          messagePayload: {
-            type: 'OAUTH_LINKED',
+          messagePayload: buildAuthResultMessagePayload(req, {
+            event: 'oauth_linked',
+            message: `Your ${providerLabel} account is now linked to Continental ID.`,
             provider: config.provider,
-          },
+          }),
         })
       );
     }
@@ -6564,6 +6865,13 @@ exports.finishOauthCallback = async (req, res) => {
           redirectUrl: returnTo,
           targetOrigin,
           closeWindow: false,
+          messagePayload: buildAuthResultMessagePayload(req, {
+            code: AUTH_ERROR_CODE.mfaRequired,
+            event: 'login_error',
+            message:
+              'This account requires multi-factor authentication. Sign in with your password first, then complete MFA to continue.',
+            provider: config.provider,
+          }),
         })
       );
     }
@@ -6590,13 +6898,14 @@ exports.finishOauthCallback = async (req, res) => {
         message: 'Returning to your Continental ID session.',
         redirectUrl,
         targetOrigin,
-        messagePayload: {
-          type: 'LOGIN_SUCCESS',
-          provider: config.provider,
+        messagePayload: buildAuthResultMessagePayload(req, {
           accessToken: sessionTokens.accessToken,
-          token: sessionTokens.accessToken,
+          apiBaseUrl: getRequestOrigin(req),
+          event: 'login_success',
+          message: 'Returning to your Continental ID session.',
+          provider: config.provider,
           user: buildUserPayload(user),
-        },
+        }),
       })
     );
   } catch (err) {
@@ -6624,6 +6933,17 @@ exports.finishOauthCallback = async (req, res) => {
         redirectUrl: returnTo,
         targetOrigin,
         closeWindow: false,
+        messagePayload: buildAuthResultMessagePayload(req, {
+          code:
+            statusCode >= 500
+              ? AUTH_ERROR_CODE.unavailable
+              : err?.statusCode === 409
+                ? AUTH_ERROR_CODE.identityConflict
+                : AUTH_ERROR_CODE.authorizationDenied,
+          event: 'login_error',
+          message,
+          provider: statePayload?.provider || req.params.provider,
+        }),
       })
     );
   }

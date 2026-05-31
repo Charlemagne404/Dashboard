@@ -100,8 +100,12 @@ test('Terra-Treck GitHub Pages origin is trusted by hosted popup config and back
 test('Pulse hosted origin is trusted by popup config and can complete the refresh-cookie flow', async () => {
   const popupConfigPath = path.resolve(__dirname, '../../login popup/auth-config.js');
   const popupConfigSource = fs.readFileSync(popupConfigPath, 'utf8');
+  const popupScriptPath = path.resolve(__dirname, '../../login popup/popup.js');
+  const popupScriptSource = fs.readFileSync(popupScriptPath, 'utf8');
 
   assert.match(popupConfigSource, /https:\/\/pulse\.continental-hub\.com/);
+  assert.match(popupScriptSource, /auth-result/);
+  assert.match(popupScriptSource, /continentalAuth/);
 
   const preflightResponse = await request(app)
     .options('/api/auth/refresh_token')
@@ -131,6 +135,8 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
   assert.equal(loginResponse.status, 200);
   assert.equal(loginResponse.body.authenticated, true);
   assert.ok(loginResponse.body.accessToken || loginResponse.body.token);
+  assert.equal(loginResponse.body.auth.code, 'auth/ok');
+  assert.ok(loginResponse.body.auth.correlationId);
 
   const refreshCookie = getRefreshCookie(loginResponse);
   assert.ok(refreshCookie);
@@ -274,9 +280,23 @@ test('verified users can log in, read their profile, and refresh their session',
   assert.equal(refreshResponse.status, 200);
   assert.equal(refreshResponse.body.message, 'Session refreshed.');
   assert.ok(refreshResponse.body.accessToken);
+  assert.equal(refreshResponse.body.auth.code, 'auth/ok');
   assert.ok(
     refreshResponse.headers['set-cookie']?.some((value) => value.startsWith('refreshToken='))
   );
+});
+
+test('refresh_token returns a machine-readable auth reason when no refresh cookie exists', async () => {
+  const response = await request(app)
+    .post('/api/auth/refresh_token')
+    .set('Origin', TEST_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({});
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.authenticated, false);
+  assert.equal(response.body.error.code, 'auth/refresh-session-missing');
+  assert.ok(response.body.error.correlationId);
 });
 
 test('the first registered account becomes the bootstrap owner account', async () => {

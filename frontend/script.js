@@ -20,6 +20,10 @@ const PREFERRED_API_BASE_URLS = [
 ];
 const HOSTED_API_BASE_URL = 'https://auth.continental-hub.com';
 const API_BASE_STORAGE_KEY = 'continental.authApiBaseUrl';
+const AUTH_RESULT_MARKER_KEY = 'continentalAuth';
+const AUTH_POPUP_MESSAGE_SOURCE = 'continental-id';
+const AUTH_POPUP_MESSAGE_TYPE = 'auth-result';
+const AUTH_POPUP_NAME = 'continental-id-login';
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const ACTIVE_TAB_STORAGE_KEY = 'dashboard.activeTab';
@@ -2368,6 +2372,160 @@ const storeSession = (data = {}) => {
   state.accessToken = safeText(token);
 };
 
+const parseAuthResultPayload = (data) => {
+  if (!data || typeof data !== 'object') return null;
+
+  const source = safeText(data.source);
+  const type = safeText(data.type);
+  const legacyType = safeText(data.legacyType);
+  const event = safeText(data.event);
+
+  if (source === AUTH_POPUP_MESSAGE_SOURCE && type === AUTH_POPUP_MESSAGE_TYPE) {
+    return {
+      accessToken: safeText(data.accessToken || data.token),
+      apiBaseUrl: normalizeApiBaseUrl(data.apiBaseUrl),
+      code: safeText(data.code),
+      correlationId: safeText(data.correlationId),
+      event: event || (legacyType === 'OAUTH_LINKED' ? 'oauth_linked' : 'login_success'),
+      message: safeText(data.message || data.error),
+      provider: safeText(data.provider).toLowerCase(),
+      user: data.user || null,
+    };
+  }
+
+  if (type === 'LOGIN_SUCCESS') {
+    return {
+      accessToken: safeText(data.accessToken || data.token),
+      apiBaseUrl: normalizeApiBaseUrl(data.apiBaseUrl),
+      code: safeText(data.code),
+      correlationId: safeText(data.correlationId),
+      event: 'login_success',
+      message: safeText(data.message || data.error),
+      provider: safeText(data.provider).toLowerCase(),
+      user: data.user || null,
+    };
+  }
+
+  if (type === 'OAUTH_LINKED') {
+    return {
+      accessToken: '',
+      apiBaseUrl: normalizeApiBaseUrl(data.apiBaseUrl),
+      code: safeText(data.code),
+      correlationId: safeText(data.correlationId),
+      event: 'oauth_linked',
+      message: safeText(data.message || data.error),
+      provider: safeText(data.provider).toLowerCase(),
+      user: null,
+    };
+  }
+
+  if (type === 'LOGIN_ERROR') {
+    return {
+      accessToken: '',
+      apiBaseUrl: normalizeApiBaseUrl(data.apiBaseUrl),
+      code: safeText(data.code),
+      correlationId: safeText(data.correlationId),
+      event: 'login_error',
+      message: safeText(data.message || data.error),
+      provider: safeText(data.provider).toLowerCase(),
+      user: null,
+    };
+  }
+
+  return null;
+};
+
+const parseRedirectAuthResult = () => {
+  const hash = safeText(window.location.hash).replace(/^#/, '');
+  if (!hash) return null;
+
+  const hashParams = new URLSearchParams(hash);
+  if (hashParams.get(AUTH_RESULT_MARKER_KEY) !== '1') {
+    return null;
+  }
+
+  const event =
+    safeText(hashParams.get('authEvent')) ||
+    (safeText(hashParams.get('accessToken')) ? 'login_success' : 'login_error');
+
+  return {
+    accessToken: safeText(hashParams.get('accessToken') || hashParams.get('token')),
+    apiBaseUrl: normalizeApiBaseUrl(hashParams.get('apiBaseUrl')),
+    code: safeText(hashParams.get('authCode')),
+    correlationId: safeText(hashParams.get('correlationId')),
+    event,
+    message: safeText(hashParams.get('authMessage')),
+    provider: safeText(hashParams.get('provider')).toLowerCase(),
+    user: null,
+  };
+};
+
+const clearRedirectAuthResult = () => {
+  if (!safeText(window.location.hash)) return;
+  history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
+};
+
+const consumeRedirectAuthResult = async () => {
+  const authResult = parseRedirectAuthResult();
+  if (!authResult) return { handled: false, ok: false };
+
+  clearRedirectAuthResult();
+
+  if (authResult.apiBaseUrl) {
+    API_BASE_URL = authResult.apiBaseUrl;
+    apiBaseValidated = true;
+    rememberApiBaseUrl(authResult.apiBaseUrl);
+  }
+
+  if (authResult.event === 'login_error') {
+    if (authResult.message) {
+      showToast(authResult.message, 'error', 5000);
+    }
+    return { handled: true, ok: false };
+  }
+
+  if (authResult.event === 'oauth_linked') {
+    try {
+      await Promise.all([loadCurrentUser(), loadLinkedAccounts()]);
+      showToast(`${getOauthProviderLabel(authResult.provider)} linked successfully.`, 'success');
+      return { handled: true, ok: true };
+    } catch (error) {
+      showToast(
+        error?.message || 'The identity provider was linked, but the dashboard could not refresh.',
+        'warn'
+      );
+      return { handled: true, ok: false };
+    }
+  }
+
+  if (!authResult.accessToken) {
+    showToast('Sign-in completed, but no access token was returned.', 'error', 5000);
+    return { handled: true, ok: false };
+  }
+
+  try {
+    storeSession(authResult);
+    await loadDashboardData({ silent: true });
+    showToast('Signed in successfully.', 'success');
+    return { handled: true, ok: true };
+  } catch (error) {
+    const refreshed = await refreshSession();
+    if (!refreshed.ok) {
+      showToast('Signed in, but the session could not be established.', 'error', 5000);
+      return { handled: true, ok: false };
+    }
+
+    try {
+      await loadDashboardData({ silent: true });
+      showToast('Signed in successfully.', 'success');
+      return { handled: true, ok: true };
+    } catch {
+      showToast('Signed in, but the dashboard could not finish loading your session.', 'error', 5000);
+      return { handled: true, ok: false };
+    }
+  }
+};
+
 const parseResponseBody = async (res) => {
   const text = await res.text();
   if (!text) return {};
@@ -2427,7 +2585,7 @@ const openPopupWindow = (url, name = 'LoginPopup') => {
   return state.loginPopupWindow;
 };
 
-const openLoginPopup = () => openPopupWindow(buildLoginPopupUrl().toString(), 'LoginPopup');
+const openLoginPopup = () => openPopupWindow(buildLoginPopupUrl().toString(), AUTH_POPUP_NAME);
 
 const openLoginPage = ({ replace = false } = {}) => {
   const loginUrl = buildLoginPopupUrl().toString();
@@ -5634,6 +5792,13 @@ const showApp = () => {
 
 const initializeSession = async () => {
   const strippedLegacyParams = stripLegacyAuthParamsFromUrl();
+  const redirectAuthResult = await consumeRedirectAuthResult();
+  if (redirectAuthResult.handled && redirectAuthResult.ok) {
+    if (strippedLegacyParams) {
+      showToast('Old sign-in parameters were removed from the URL. The current session flow is now in use.', 'info', 5000);
+    }
+    return { ok: true };
+  }
 
   const refreshed = await refreshSession();
   if (!refreshed.ok) return refreshed;
@@ -7772,23 +7937,32 @@ const setupEventHandlers = () => {
 
   window.addEventListener('message', async (event) => {
     if (!isTrustedLoginOrigin(event.origin)) return;
-    const messageType = safeText(event.data?.type);
-    if (!messageType) return;
+    const authResult = parseAuthResultPayload(event.data);
+    if (!authResult) return;
 
-    if (messageType === 'OAUTH_LINKED') {
+    if (authResult.event === 'oauth_linked') {
       try {
         await Promise.all([loadCurrentUser(), loadLinkedAccounts()]);
         closeLoginPopup();
-        showToast(`${getOauthProviderLabel(event.data?.provider)} linked successfully.`, 'success');
+        showToast(`${getOauthProviderLabel(authResult.provider)} linked successfully.`, 'success');
       } catch (err) {
         showToast(err.message || 'The identity provider was linked, but the dashboard could not refresh.', 'warn');
       }
       return;
     }
 
-    if (messageType !== 'LOGIN_SUCCESS') return;
+    if (authResult.event === 'login_error') {
+      showToast(
+        authResult.message || 'Authentication could not be completed.',
+        'error',
+        5000
+      );
+      return;
+    }
 
-    const messageApiBase = normalizeApiBaseUrl(event.data?.apiBaseUrl);
+    if (authResult.event !== 'login_success') return;
+
+    const messageApiBase = authResult.apiBaseUrl;
     if (messageApiBase) {
       API_BASE_URL = messageApiBase;
       apiBaseValidated = true;
@@ -7796,7 +7970,7 @@ const setupEventHandlers = () => {
     }
 
     try {
-      storeSession(event.data || {});
+      storeSession(authResult || {});
       await loadDashboardData({ silent: true });
       closeLoginPopup();
       showApp();
