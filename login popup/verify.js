@@ -182,6 +182,7 @@ function getRequestErrorMessage(error, fallback) {
 }
 
 const popupUrl = new URL('popup.html', window.location.href);
+if (params.get('appId')) popupUrl.searchParams.set('appId', params.get('appId'));
 if (params.get('origin')) popupUrl.searchParams.set('origin', params.get('origin'));
 if (params.get('redirect')) popupUrl.searchParams.set('redirect', params.get('redirect'));
 if (params.get('apiBaseUrl')) popupUrl.searchParams.set('apiBaseUrl', params.get('apiBaseUrl'));

@@ -10,12 +10,14 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 
 const ApiRateLimitBucket = require('./models/ApiRateLimitBucket');
+const AuthApp = require('./models/AuthApp');
 const LoginThrottle = require('./models/LoginThrottle');
 const User = require('./models/User');
 const authRoutes = require('./routes/authRoutes');
 const grimoireRoutes = require('./routes/grimoireRoutes');
 const vanguardRoutes = require('./routes/vanguardRoutes');
 const { dedupePasskeysAcrossUsers } = require('./utils/passkeyHardening');
+const { seedDefaultAuthApps } = require('./utils/authApps');
 const { migrateUsersToLatestSecurityState } = require('./utils/securityHardening');
 const { migrateUsersToLatestIdentity } = require('./utils/userIdentity');
 
@@ -421,6 +423,8 @@ const runStartupMaintenance = async () => {
       () => dedupePasskeysAcrossUsers({ logger: console }),
       errors
     );
+    await runMaintenanceTask('auth app seed', () => seedDefaultAuthApps({ logger: console }), errors);
+    await runMaintenanceTask('auth app index sync', () => AuthApp.syncIndexes(), errors);
     await runMaintenanceTask('user index sync', () => User.syncIndexes(), errors);
     await runMaintenanceTask('login throttle index sync', () => LoginThrottle.syncIndexes(), errors);
     await runMaintenanceTask(

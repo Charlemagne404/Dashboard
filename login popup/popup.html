@@ -32,6 +32,23 @@
 
       <div id="status-banner" class="status-banner" data-status="info" aria-live="polite" aria-atomic="true"></div>
 
+      <section id="session-reuse-card" class="session-reuse-card" hidden aria-labelledby="session-reuse-title">
+        <p class="auth-eyebrow">Existing session</p>
+        <h3 id="session-reuse-title">Continue with Continental ID</h3>
+        <p class="session-reuse-copy">
+          This device already has an active Continental ID session. Continue with it or switch to a different account.
+        </p>
+        <div class="session-reuse-summary">
+          <p id="session-reuse-name" class="session-reuse-name">Continental user</p>
+          <p id="session-reuse-email" class="session-reuse-email">account@example.com</p>
+        </div>
+        <div class="session-reuse-actions">
+          <button id="session-reuse-continue-btn" class="submit-btn" type="button">Continue</button>
+          <button id="session-reuse-switch-btn" class="ghost-btn" type="button">Use a different account</button>
+        </div>
+      </section>
+
+      <div id="auth-flow">
       <div class="auth-tabs" role="tablist" aria-label="Authentication options">
         <button
           id="login-toggle"
@@ -395,6 +412,7 @@
           <button type="submit" id="register-btn" class="submit-btn">Create account</button>
         </form>
       </section>
+      </div>
 
       <div class="auth-divider"></div>
 

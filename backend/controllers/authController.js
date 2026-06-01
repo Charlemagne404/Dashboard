@@ -60,6 +60,7 @@ const {
   normalizeAccountStatus,
   shouldAutoGrantOwnerRole,
 } = require('../utils/accountAccess');
+const { findRegisteredAuthApp } = require('../utils/authApps');
 
 const ACCESS_TOKEN_TTL = process.env.JWT_EXPIRES_IN || '15m';
 const REFRESH_TOKEN_TTL = process.env.REFRESH_TOKEN_EXPIRES_IN || '7d';
@@ -203,12 +204,18 @@ const OAUTH_APP_ORIGINS = new Set([
 const DEFAULT_LOGIN_POPUP_URL = `${DEFAULT_LOGIN_ORIGIN}/popup.html`;
 const DEFAULT_EMAIL_VERIFY_PATH = '/verify.html';
 const DEFAULT_PASSWORD_RESET_PATH = '/reset-password.html';
+const AUTH_POPUP_NAME = 'continental-id-login';
 const AUTH_RESULT_MARKER_KEY = 'continentalAuth';
 const AUTH_POPUP_MESSAGE_SOURCE = 'continental-id';
 const AUTH_POPUP_MESSAGE_TYPE = 'auth-result';
+const BOOTSTRAP_RESULT_CONTRACT_VERSION = 2;
 const AUTH_ERROR_CODE = {
+  appContextRejected: 'auth/app-context-rejected',
+  appDisabled: 'auth/app-disabled',
+  appUnknown: 'auth/app-unknown',
   accessTokenMissing: 'auth/access-token-missing',
   authorizationDenied: 'auth/authorization-denied',
+  discordUnlinked: 'auth/discord-unlinked',
   emailUnverified: 'auth/email-unverified',
   identityConflict: 'auth/identity-conflict',
   invalidCredentials: 'auth/invalid-credentials',
@@ -586,6 +593,130 @@ const resolveTrustedOauthRedirectUrl = (value, fallbackOrigin = DEFAULT_DASHBOAR
     }
     return resolved.toString();
   } catch {
+    return new URL('/', safeOrigin).toString();
+  }
+};
+
+const normalizeAppId = (value) => sanitizeText(value, 80).toLowerCase();
+
+const isAllowedAuthAppOrigin = (authApp, origin, field = 'allowedOrigins') => {
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(normalizedOrigin);
+    if (isLocalHostname(parsed.hostname)) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+
+  const allowedOrigins = Array.isArray(authApp?.[field]) ? authApp[field] : [];
+  return allowedOrigins.includes(normalizedOrigin);
+};
+
+const getDefaultAuthAppOrigin = (authApp) =>
+  normalizeOrigin(Array.isArray(authApp?.allowedOrigins) ? authApp.allowedOrigins[0] : '');
+
+const requireRegisteredAuthApp = async (appId) => {
+  const normalizedAppId = normalizeAppId(appId);
+  if (!normalizedAppId) {
+    throw createHttpError(400, 'A valid auth app ID is required.');
+  }
+
+  const authApp = await findRegisteredAuthApp(normalizedAppId);
+  if (!authApp) {
+    const error = createHttpError(404, 'Unknown Continental auth app.');
+    error.authCode = AUTH_ERROR_CODE.appUnknown;
+    throw error;
+  }
+
+  if (authApp.status !== 'active') {
+    const error = createHttpError(403, 'This Continental auth app is disabled.');
+    error.authCode = AUTH_ERROR_CODE.appDisabled;
+    throw error;
+  }
+
+  return authApp;
+};
+
+const resolveAuthAppOriginContext = async ({
+  appId = '',
+  origin = '',
+  fallbackOrigin = DEFAULT_DASHBOARD_ORIGIN,
+} = {}) => {
+  const normalizedAppId = normalizeAppId(appId);
+  if (!normalizedAppId) {
+    const targetOrigin = resolveTrustedOauthAppOrigin(origin || fallbackOrigin, fallbackOrigin);
+    return {
+      authApp: null,
+      targetOrigin,
+    };
+  }
+
+  const authApp = await requireRegisteredAuthApp(normalizedAppId);
+  const candidateOrigin = normalizeOrigin(origin);
+  if (isAllowedAuthAppOrigin(authApp, candidateOrigin)) {
+    return {
+      authApp,
+      targetOrigin: candidateOrigin,
+    };
+  }
+
+  const normalizedFallbackOrigin = normalizeOrigin(fallbackOrigin);
+  if (isAllowedAuthAppOrigin(authApp, normalizedFallbackOrigin)) {
+    return {
+      authApp,
+      targetOrigin: normalizedFallbackOrigin,
+    };
+  }
+
+  const error = createHttpError(
+    403,
+    'The requested app origin is not allowed for this Continental auth app.'
+  );
+  error.authCode = AUTH_ERROR_CODE.appContextRejected;
+  throw error;
+};
+
+const resolveAuthAppRedirectUrl = ({
+  authApp = null,
+  redirect = '',
+  targetOrigin = '',
+  fallbackOrigin = DEFAULT_DASHBOARD_ORIGIN,
+} = {}) => {
+  if (!authApp) {
+    return resolveTrustedOauthRedirectUrl(redirect, targetOrigin || fallbackOrigin);
+  }
+
+  const safeOrigin =
+    normalizeOrigin(targetOrigin) ||
+    getDefaultAuthAppOrigin(authApp) ||
+    normalizeOrigin(fallbackOrigin) ||
+    DEFAULT_DASHBOARD_ORIGIN;
+
+  if (!redirect) {
+    return new URL('/', safeOrigin).toString();
+  }
+
+  try {
+    const resolved = new URL(String(redirect), safeOrigin);
+    if (!isAllowedAuthAppOrigin(authApp, resolved.origin, 'allowedRedirectOrigins')) {
+      const error = createHttpError(
+        403,
+        'The requested redirect URL is not allowed for this Continental auth app.'
+      );
+      error.authCode = AUTH_ERROR_CODE.appContextRejected;
+      throw error;
+    }
+    return resolved.toString();
+  } catch (err) {
+    if (err?.statusCode) {
+      throw err;
+    }
     return new URL('/', safeOrigin).toString();
   }
 };
@@ -3616,6 +3747,7 @@ const buildDeviceCookieOptions = (req) => {
     sameSite: cookieOptions.sameSite,
     path: '/',
     maxAge: DEVICE_ID_TTL_MS,
+    ...(cookieOptions.domain ? { domain: cookieOptions.domain } : {}),
   };
 };
 
@@ -4360,6 +4492,209 @@ const buildUserPayload = (user) => {
       passkeys: getPasskeyState(user),
     },
     migration: buildMigrationPayload(user),
+  };
+};
+
+const getTokenExpiryDeltaSec = (token) => {
+  try {
+    const decoded = jwt.decode(token);
+    const exp = Number(decoded?.exp || 0);
+    if (!exp) return 0;
+    return Math.max(0, exp - Math.floor(Date.now() / 1000));
+  } catch {
+    return 0;
+  }
+};
+
+const buildBootstrapAppPayload = (authApp) => ({
+  appId: normalizeAppId(authApp?.appId),
+  displayName: sanitizeText(authApp?.displayName, 120) || 'Continental app',
+  dashboardUrl: sanitizeText(authApp?.dashboardUrl, 2000),
+});
+
+const buildBootstrapLinkedAccountsPayload = (user) => {
+  const providerStates = buildOauthProvidersState(user);
+  const linkedAccounts = {};
+
+  for (const provider of OAUTH_PROVIDERS) {
+    const state = providerStates[provider] || {};
+    linkedAccounts[provider] = {
+      linked: Boolean(state.linked),
+      providerUserId: sanitizeText(state.providerUserId, 160),
+      username: sanitizeText(state.username, 120),
+      email: sanitizeText(state.email, 320).toLowerCase(),
+      emailVerified: Boolean(state.emailVerified),
+      profileUrl: sanitizeText(state.profileUrl, 1000),
+      avatarUrl: sanitizeText(state.avatarUrl, 1000),
+      linkedAt: state.linkedAt || null,
+      lastUsedAt: state.lastUsedAt || null,
+    };
+  }
+
+  return linkedAccounts;
+};
+
+const buildBootstrapAppAccess = (authApp, user, linkedAccounts) => {
+  if (!user || !authApp) {
+    return {
+      allowed: false,
+      reasonCode: AUTH_ERROR_CODE.refreshSessionMissing,
+      reasonMessage: 'No active session is available for this app.',
+      capabilities: [],
+    };
+  }
+
+  if (authApp.policyResolver === 'vanguard-control-center') {
+    if (!linkedAccounts?.discord?.linked) {
+      return {
+        allowed: false,
+        reasonCode: AUTH_ERROR_CODE.discordUnlinked,
+        reasonMessage: 'Link Discord on this Continental ID account before opening Vanguard.',
+        capabilities: [],
+      };
+    }
+
+    return {
+      allowed: true,
+      reasonCode: null,
+      reasonMessage: null,
+      capabilities: ['control_center'],
+    };
+  }
+
+  return {
+    allowed: true,
+    reasonCode: null,
+    reasonMessage: null,
+    capabilities: [],
+  };
+};
+
+const buildBootstrapRequirements = (user, authApp, linkedAccounts, appAccess) => {
+  const requirements = [];
+
+  if (!user?.isVerified) {
+    requirements.push('verify_email');
+  }
+
+  const requiredLinkedProviders = Array.isArray(authApp?.requiredLinkedProviders)
+    ? authApp.requiredLinkedProviders
+    : [];
+
+  if (
+    requiredLinkedProviders.includes('discord') &&
+    !linkedAccounts?.discord?.linked
+  ) {
+    requirements.push('link_discord');
+  }
+
+  if (
+    appAccess &&
+    appAccess.allowed === false &&
+    requirements.length === 0 &&
+    appAccess.reasonCode &&
+    user
+  ) {
+    requirements.push('request_access');
+  }
+
+  return Array.from(new Set(requirements));
+};
+
+const buildBootstrapCurrentUserPayload = (user) => {
+  const payload = buildUserPayload(user);
+  return {
+    userId: payload.userId,
+    continentalId: payload.continentalId,
+    email: payload.email,
+    username: payload.username,
+    displayName: payload.displayName,
+    isVerified: payload.isVerified,
+    createdAt: payload.createdAt,
+    updatedAt: payload.updatedAt,
+    lastLoginAt: payload.lastLoginAt,
+    lastLoginIp: payload.lastLoginIp,
+    accountRole: payload.authority?.role || normalizeAccountRole(user?.accountRole),
+    accountStatus: payload.authority?.status || normalizeAccountStatus(user?.accountStatus),
+  };
+};
+
+const buildBootstrapAuthMeta = () => ({
+  popup: {
+    source: AUTH_POPUP_MESSAGE_SOURCE,
+    type: AUTH_POPUP_MESSAGE_TYPE,
+    popupName: AUTH_POPUP_NAME,
+  },
+  resultContractVersion: BOOTSTRAP_RESULT_CONTRACT_VERSION,
+});
+
+const buildBootstrapUnauthenticatedPayload = (
+  req,
+  authApp,
+  {
+    code = AUTH_ERROR_CODE.refreshSessionMissing,
+    message = 'No active session is available for this app.',
+    requirements = [],
+    appAccess = null,
+    retryable = false,
+  } = {}
+) => ({
+  ...buildAuthErrorPayload(req, {
+    code,
+    message,
+    retryable,
+  }),
+  app: buildBootstrapAppPayload(authApp),
+  session: {
+    accessToken: '',
+    sid: '',
+    expiresInSec: 0,
+    canRefresh: false,
+  },
+  user: null,
+  linkedAccounts: buildBootstrapLinkedAccountsPayload(null),
+  requirements: Array.from(new Set(requirements)),
+  appAccess:
+    appAccess || {
+      allowed: false,
+      reasonCode: code,
+      reasonMessage: message,
+      capabilities: [],
+    },
+  auth: buildBootstrapAuthMeta(),
+});
+
+const buildBootstrapAuthenticatedPayload = (
+  req,
+  authApp,
+  user,
+  {
+    accessToken = '',
+    sid = '',
+    canRefresh = true,
+  } = {}
+) => {
+  const linkedAccounts = buildBootstrapLinkedAccountsPayload(user);
+  const appAccess = buildBootstrapAppAccess(authApp, user, linkedAccounts);
+  const requirements = buildBootstrapRequirements(user, authApp, linkedAccounts, appAccess);
+
+  return {
+    ...buildAuthSuccessMeta(req),
+    authenticated: true,
+    app: buildBootstrapAppPayload(authApp),
+    session: {
+      accessToken,
+      sid: sanitizeText(sid, 120),
+      expiresInSec: getTokenExpiryDeltaSec(accessToken),
+      canRefresh: Boolean(canRefresh),
+    },
+    user: buildBootstrapCurrentUserPayload(user),
+    linkedAccounts,
+    requirements,
+    appAccess,
+    auth: buildBootstrapAuthMeta(),
+    accessToken,
+    token: accessToken,
   };
 };
 
@@ -5269,6 +5604,57 @@ const resolveRefreshSessionFromCookie = async (req, res) => {
   }
 
   return { user, sid: '', session: null, tokenState: 'legacy' };
+};
+
+const resolveAccessTokenBootstrapSession = async (accessToken) => {
+  let payload;
+  try {
+    payload = verifyTypedJwt({
+      token: accessToken,
+      secret: process.env.JWT_SECRET,
+      audience: ACCESS_TOKEN_AUDIENCE,
+      type: 'access_token',
+      allowLegacy: true,
+    });
+  } catch {
+    const error = createHttpError(401, 'Token invalid or expired.');
+    error.authCode = AUTH_ERROR_CODE.invalidToken;
+    throw error;
+  }
+
+  const userId = sanitizeText(payload?.userId || payload?.sub, 120);
+  const user = await getUserById(userId);
+  if (!user) {
+    const error = createHttpError(401, 'User not found.');
+    error.authCode = AUTH_ERROR_CODE.userNotFound;
+    throw error;
+  }
+
+  if (isSuspendedAccount(user.accountStatus)) {
+    const error = createHttpError(403, 'This account is suspended.');
+    error.authCode = AUTH_ERROR_CODE.suspended;
+    throw error;
+  }
+
+  if (user.refreshTokenVersion !== payload.tokenVersion) {
+    const error = createHttpError(401, 'Session is no longer valid.');
+    error.authCode = AUTH_ERROR_CODE.sessionRevoked;
+    throw error;
+  }
+
+  const sid = sanitizeText(payload.sid, 120);
+  if (sid && !findRefreshSession(user, sid)) {
+    const error = createHttpError(401, 'Session has been revoked.');
+    error.authCode = AUTH_ERROR_CODE.sessionRevoked;
+    throw error;
+  }
+
+  return {
+    user,
+    sid,
+    session: sid ? findRefreshSession(user, sid) : null,
+    tokenState: 'access-token',
+  };
 };
 
 exports.register = async (req, res) => {
@@ -6358,6 +6744,121 @@ exports.refreshToken = async (req, res) => {
   }
 };
 
+exports.bootstrap = async (req, res) => {
+  const appId = normalizeAppId(req.body?.appId);
+  const inlineAccessToken = sanitizeText(req.body?.accessToken || req.body?.token, 4000);
+
+  try {
+    const authApp = await requireRegisteredAuthApp(appId);
+
+    let resolvedSession = null;
+    if (inlineAccessToken) {
+      resolvedSession = await resolveAccessTokenBootstrapSession(inlineAccessToken);
+    } else {
+      resolvedSession = await resolveRefreshSessionFromCookie(req, res);
+    }
+
+    if (!resolvedSession?.user || resolvedSession.replayDetected) {
+      if (resolvedSession?.replayDetected) {
+        clearRefreshCookie(res, req);
+      }
+
+      return res.status(inlineAccessToken ? 401 : 200).json(
+        buildBootstrapUnauthenticatedPayload(req, authApp, {
+          code: inlineAccessToken ? AUTH_ERROR_CODE.invalidToken : AUTH_ERROR_CODE.refreshSessionMissing,
+          message: inlineAccessToken ? 'Token invalid or expired.' : 'No active refresh session.',
+        })
+      );
+    }
+
+    if (!resolvedSession.user.isVerified) {
+      if (!inlineAccessToken) {
+        clearRefreshCookie(res, req);
+      }
+
+      return res.status(inlineAccessToken ? 403 : 200).json(
+        buildBootstrapUnauthenticatedPayload(req, authApp, {
+          code: AUTH_ERROR_CODE.emailUnverified,
+          message: 'Verify your email before signing in.',
+          requirements: ['verify_email'],
+        })
+      );
+    }
+
+    if (isSuspendedAccount(resolvedSession.user.accountStatus)) {
+      if (!inlineAccessToken) {
+        clearRefreshCookie(res, req);
+      }
+
+      return res.status(403).json(
+        buildBootstrapUnauthenticatedPayload(req, authApp, {
+          code: AUTH_ERROR_CODE.suspended,
+          message: 'This account is suspended.',
+        })
+      );
+    }
+
+    let accessToken = inlineAccessToken;
+    let sid = sanitizeText(resolvedSession.sid, 120);
+    let canRefresh = Boolean(req.cookies?.refreshToken);
+
+    if (!accessToken) {
+      let tokenPair;
+      if (resolvedSession.tokenState === 'grace') {
+        tokenPair = reissueCurrentRefreshSession(
+          resolvedSession.user,
+          req,
+          resolvedSession.sid,
+          resolvedSession.session
+        );
+      } else if (resolvedSession.sid) {
+        tokenPair = rotateRefreshSessionToken(
+          resolvedSession.user,
+          req,
+          resolvedSession.sid,
+          resolvedSession.session
+        );
+      } else {
+        tokenPair = createTrackedRefreshSession(resolvedSession.user, req);
+        sid = sanitizeText(tokenPair.sid, 120);
+      }
+
+      await resolvedSession.user.save();
+      res.cookie('refreshToken', tokenPair.refreshToken, buildCookieOptions(req));
+      accessToken = tokenPair.accessToken;
+      sid = sid || sanitizeText(resolvedSession.sid, 120);
+      canRefresh = true;
+    }
+
+    return res.status(200).json(
+      buildBootstrapAuthenticatedPayload(req, authApp, resolvedSession.user, {
+        accessToken,
+        sid,
+        canRefresh,
+      })
+    );
+  } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json(
+        buildAuthErrorPayload(req, {
+          code: err.authCode || AUTH_ERROR_CODE.unavailable,
+          message: err.message,
+          retryable: false,
+        })
+      );
+    }
+
+    console.error('Bootstrap error:', err);
+    return res.status(500).json(
+      buildAuthErrorPayload(req, {
+        code: AUTH_ERROR_CODE.unavailable,
+        message: 'Failed to bootstrap Continental app session.',
+        retryable: true,
+      })
+    );
+  }
+};
+
 exports.updateProfile = async (req, res) => {
   const incoming = req.body || {};
   const currentPassword = req.body?.currentPassword || '';
@@ -6624,19 +7125,33 @@ exports.updatePreferences = async (req, res) => {
 
 exports.startOauthLogin = async (req, res) => {
   const providerLabel = getOauthProviderLabel(req.params.provider);
+  const requestedAppId = normalizeAppId(req.query?.appId);
 
   try {
     const config = getOauthProviderConfig(req.params.provider, req);
-    const targetOrigin = resolveTrustedOauthAppOrigin(req.query?.origin || DEFAULT_DASHBOARD_ORIGIN);
+    const { authApp, targetOrigin } = await resolveAuthAppOriginContext({
+      appId: requestedAppId,
+      origin: req.query?.origin || DEFAULT_DASHBOARD_ORIGIN,
+      fallbackOrigin: DEFAULT_DASHBOARD_ORIGIN,
+    });
     if (!targetOrigin) {
       throw createHttpError(503, 'OAuth app origins are not configured on this server.');
     }
-    const redirectUrl = resolveTrustedOauthRedirectUrl(req.query?.redirect, targetOrigin);
-    const returnTo = resolveTrustedOauthRedirectUrl(
+    const redirectUrl = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect: req.query?.redirect,
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
+    const returnTo = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect:
       req.query?.returnTo || req.query?.return_to || resolveLoginPopupPageUrl(req) || redirectUrl,
-      targetOrigin
-    );
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
     const state = buildOauthStateToken({
+      appId: authApp?.appId || requestedAppId || '',
       flow: 'login',
       provider: config.provider,
       targetOrigin,
@@ -6651,7 +7166,7 @@ exports.startOauthLogin = async (req, res) => {
           title: `${providerLabel} sign-in unavailable`,
           message: err.message,
           redirectUrl: resolveTrustedOauthRedirectUrl(req.query?.returnTo || req.query?.redirect),
-          targetOrigin: resolveTrustedOauthAppOrigin(req.query?.origin || ''),
+          targetOrigin: normalizeOrigin(req.query?.origin || ''),
           closeWindow: false,
         })
       );
@@ -6671,6 +7186,7 @@ exports.startOauthLogin = async (req, res) => {
 
 exports.startOauthLink = async (req, res) => {
   const providerLabel = getOauthProviderLabel(req.params.provider);
+  const requestedAppId = normalizeAppId(req.body?.appId);
 
   try {
     const user = await getUserById(req.user.id);
@@ -6680,15 +7196,28 @@ exports.startOauthLink = async (req, res) => {
 
     const config = getOauthProviderConfig(req.params.provider, req);
     const browserOrigin = extractBrowserOrigin(req);
-    const targetOrigin = resolveTrustedOauthAppOrigin(
-      req.body?.origin || browserOrigin || DEFAULT_DASHBOARD_ORIGIN
-    );
+    const { authApp, targetOrigin } = await resolveAuthAppOriginContext({
+      appId: requestedAppId,
+      origin: req.body?.origin || browserOrigin || DEFAULT_DASHBOARD_ORIGIN,
+      fallbackOrigin: browserOrigin || DEFAULT_DASHBOARD_ORIGIN,
+    });
     if (!targetOrigin) {
       throw createHttpError(503, 'OAuth app origins are not configured on this server.');
     }
-    const redirectUrl = resolveTrustedOauthRedirectUrl(req.body?.redirect, targetOrigin);
-    const returnTo = resolveTrustedOauthRedirectUrl(req.body?.returnTo || redirectUrl, targetOrigin);
+    const redirectUrl = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect: req.body?.redirect,
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
+    const returnTo = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect: req.body?.returnTo || redirectUrl,
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
     const state = buildOauthStateToken({
+      appId: authApp?.appId || requestedAppId || '',
       flow: 'link',
       provider: config.provider,
       userId: req.user.id,
@@ -6729,9 +7258,23 @@ exports.finishOauthCallback = async (req, res) => {
     const providerLabel = getOauthProviderLabel(config.provider);
     const tokenPayload = await requestOauthAccessToken(config, code);
     const identityProfile = await requestOauthIdentityProfile(config, tokenPayload);
-    const targetOrigin = resolveTrustedOauthAppOrigin(statePayload.targetOrigin || '');
-    const redirectUrl = resolveTrustedOauthRedirectUrl(statePayload.redirectUrl, targetOrigin);
-    const returnTo = resolveTrustedOauthRedirectUrl(statePayload.returnTo || redirectUrl, targetOrigin);
+    const { authApp, targetOrigin } = await resolveAuthAppOriginContext({
+      appId: statePayload.appId,
+      origin: statePayload.targetOrigin || '',
+      fallbackOrigin: DEFAULT_DASHBOARD_ORIGIN,
+    });
+    const redirectUrl = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect: statePayload.redirectUrl,
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
+    const returnTo = resolveAuthAppRedirectUrl({
+      authApp,
+      redirect: statePayload.returnTo || redirectUrl,
+      targetOrigin,
+      fallbackOrigin: targetOrigin,
+    });
 
     if (statePayload.flow === 'link') {
       const targetUser = await getUserById(statePayload.userId);
@@ -6909,7 +7452,7 @@ exports.finishOauthCallback = async (req, res) => {
       })
     );
   } catch (err) {
-    const targetOrigin = resolveTrustedOauthAppOrigin(statePayload?.targetOrigin || '');
+    const targetOrigin = normalizeOrigin(statePayload?.targetOrigin || '');
     const returnTo = resolveTrustedOauthRedirectUrl(
       statePayload?.returnTo || statePayload?.redirectUrl,
       targetOrigin || DEFAULT_DASHBOARD_ORIGIN

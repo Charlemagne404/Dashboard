@@ -2,6 +2,8 @@ const AUTH_CONFIG = window.__AUTH_CONFIG__ || {};
 const LOCAL_HOSTS = new Set(AUTH_CONFIG.localHosts || ['localhost', '127.0.0.1']);
 const TRUSTED_APP_ORIGINS = new Set(AUTH_CONFIG.trustedAppOrigins || []);
 const TRUSTED_API_ORIGINS = new Set(AUTH_CONFIG.trustedApiOrigins || []);
+const AUTH_APPS =
+  AUTH_CONFIG.authApps && typeof AUTH_CONFIG.authApps === 'object' ? AUTH_CONFIG.authApps : {};
 const DEFAULT_DASHBOARD_ORIGIN =
   AUTH_CONFIG.defaultDashboardOrigin || 'https://dashboard.continental-hub.com';
 const PREFERRED_API_ORIGINS = Array.isArray(AUTH_CONFIG.preferredApiOrigins)
@@ -86,6 +88,7 @@ const params = new URLSearchParams(window.location.search);
 
 const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
 const safeText = (value) => String(value || '').trim();
+const popupAppId = safeText(params.get('appId')).toLowerCase();
 const normalizeForModeration = (value) =>
   safeText(value)
     .toLowerCase()
@@ -123,7 +126,52 @@ const HOSTED_APP_HOSTS = new Set(
     })
     .filter(Boolean)
 );
+const getConfiguredAuthApp = (appId = popupAppId) => {
+  const normalizedAppId = safeText(appId).toLowerCase();
+  const config =
+    normalizedAppId && AUTH_APPS[normalizedAppId] && typeof AUTH_APPS[normalizedAppId] === 'object'
+      ? AUTH_APPS[normalizedAppId]
+      : null;
+
+  if (!config) return null;
+
+  return {
+    appId: normalizedAppId,
+    displayName: safeText(config.displayName) || 'Continental app',
+    allowedOrigins: Array.from(
+      new Set((Array.isArray(config.allowedOrigins) ? config.allowedOrigins : []).map((value) => safeText(value)))
+    ).filter(Boolean),
+    allowedRedirectOrigins: Array.from(
+      new Set(
+        (Array.isArray(config.allowedRedirectOrigins) ? config.allowedRedirectOrigins : []).map((value) =>
+          safeText(value)
+        )
+      )
+    ).filter(Boolean),
+    firstParty: Boolean(config.firstParty),
+  };
+};
+const popupAuthApp = getConfiguredAuthApp();
+
+const isAllowedAuthAppOrigin = (authApp, origin, field = 'allowedOrigins') => {
+  if (!authApp || !origin) return false;
+
+  try {
+    const parsed = new URL(origin);
+    if (LOCAL_HOSTS.has(parsed.hostname)) return true;
+    const allowedOrigins = Array.isArray(authApp[field]) ? authApp[field] : [];
+    return allowedOrigins.includes(parsed.origin);
+  } catch {
+    return false;
+  }
+};
 const statusBanner = document.getElementById('status-banner');
+const sessionReuseCard = document.getElementById('session-reuse-card');
+const sessionReuseName = document.getElementById('session-reuse-name');
+const sessionReuseEmail = document.getElementById('session-reuse-email');
+const sessionReuseContinueBtn = document.getElementById('session-reuse-continue-btn');
+const sessionReuseSwitchBtn = document.getElementById('session-reuse-switch-btn');
+const authFlow = document.getElementById('auth-flow');
 const loginToggle = document.getElementById('login-toggle');
 const registerToggle = document.getElementById('register-toggle');
 const loginPanel = document.getElementById('login-panel');
@@ -171,6 +219,7 @@ let loginCooldownTimer = 0;
 let loginCooldownUntil = 0;
 let apiBaseValidated = false;
 let apiBaseResolutionPromise = null;
+let reusableSessionPayload = null;
 
 const isTrustedApiOrigin = (origin) => {
   if (!origin) return false;
@@ -319,6 +368,9 @@ const resolveTrustedOrigin = (value) => {
 
   try {
     const origin = new URL(value).origin;
+    if (popupAuthApp) {
+      return isAllowedAuthAppOrigin(popupAuthApp, origin) ? origin : '';
+    }
     return isTrustedAppOrigin(origin) ? origin : '';
   } catch {
     return '';
@@ -329,6 +381,22 @@ const targetOrigin =
   resolveTrustedOrigin(params.get('origin')) || resolveTrustedOrigin(document.referrer) || '';
 
 const resolveRedirectUrl = (value, fallbackOrigin) => {
+  if (popupAuthApp) {
+    const safeFallbackOrigin = isAllowedAuthAppOrigin(popupAuthApp, fallbackOrigin)
+      ? fallbackOrigin
+      : popupAuthApp.allowedOrigins[0] || DEFAULT_DASHBOARD_ORIGIN;
+
+    try {
+      const resolved = new URL(value || '/', safeFallbackOrigin);
+      if (!isAllowedAuthAppOrigin(popupAuthApp, resolved.origin, 'allowedRedirectOrigins')) {
+        return new URL('/', safeFallbackOrigin).toString();
+      }
+      return resolved.toString();
+    } catch {
+      return new URL('/', safeFallbackOrigin).toString();
+    }
+  }
+
   const safeFallbackOrigin = isTrustedAppOrigin(fallbackOrigin)
     ? fallbackOrigin
     : DEFAULT_DASHBOARD_ORIGIN;
@@ -415,6 +483,9 @@ const getOauthProviderButton = (provider) => {
 const buildOauthStartUrl = (provider) => {
   const normalized = safeText(provider).toLowerCase();
   const startUrl = new URL(`${getAuthApiBase()}/oauth/${encodeURIComponent(normalized)}/start`);
+  if (popupAuthApp?.appId) {
+    startUrl.searchParams.set('appId', popupAuthApp.appId);
+  }
   startUrl.searchParams.set('origin', targetOrigin || DEFAULT_DASHBOARD_ORIGIN);
   startUrl.searchParams.set('redirect', getRedirectUrl());
   startUrl.searchParams.set('returnTo', window.location.href);
@@ -426,6 +497,35 @@ const setStatus = (message, tone = 'error') => {
   statusBanner.textContent = text;
   statusBanner.dataset.status = tone;
   statusBanner.classList.toggle('is-visible', Boolean(text));
+};
+
+const setAuthFlowVisible = (visible) => {
+  authFlow.hidden = !visible;
+};
+
+const hideReusableSession = () => {
+  reusableSessionPayload = null;
+  sessionReuseCard.hidden = true;
+  sessionReuseContinueBtn.disabled = false;
+  setButtonLabel(sessionReuseContinueBtn, 'Continue');
+  setAuthFlowVisible(true);
+};
+
+const showReusableSession = (sessionPayload, userPayload) => {
+  const displayName = safeText(userPayload?.displayName || userPayload?.username) || 'Continental user';
+  const email = safeText(userPayload?.email) || 'Signed in on this device';
+
+  reusableSessionPayload = {
+    ...sessionPayload,
+    accessToken: safeText(sessionPayload?.accessToken || sessionPayload?.token),
+    token: safeText(sessionPayload?.accessToken || sessionPayload?.token),
+    user: userPayload || null,
+  };
+  sessionReuseName.textContent = displayName;
+  sessionReuseEmail.textContent = email;
+  sessionReuseCard.hidden = false;
+  showVerificationActions(false);
+  setAuthFlowVisible(false);
 };
 
 const resolveVerificationIdentifier = (...candidates) => {
@@ -933,6 +1033,75 @@ const handleResendVerification = async () => {
   }
 };
 
+const fetchExistingSessionProfile = async (accessToken) => {
+  const response = await fetch(`${getAuthApiBase()}/me`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    credentials: 'include',
+  });
+  const data = await parseJson(response);
+
+  if (!response.ok) {
+    throw new Error(data.message || 'Could not load the active Continental ID session.');
+  }
+
+  return data.user || data;
+};
+
+const attemptExistingSessionReuse = async () => {
+  setStatus('Checking for an active Continental ID session on this device...', 'info');
+
+  try {
+    await ensureApiBaseUrl();
+  } catch {
+    setStatus('', 'info');
+    return false;
+  }
+
+  try {
+    const response = await fetch(`${getAuthApiBase()}/refresh_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({}),
+    });
+    const data = await parseJson(response);
+
+    if (data.requiresVerification) {
+      rememberVerificationIdentifier(data.identifier, data.email, data.user?.email);
+      resetLoginChallenge();
+      showVerificationActions(true);
+      setStatus(
+        data.message || 'Verify your email before signing in.',
+        data.verificationEmail?.sent === false ? 'warn' : 'success'
+      );
+      return true;
+    }
+
+    const accessToken = safeText(data?.accessToken || data?.token);
+    if (!response.ok || !data.authenticated || !accessToken) {
+      setStatus('', 'info');
+      return false;
+    }
+
+    const user = await fetchExistingSessionProfile(accessToken);
+    showReusableSession(
+      {
+        ...data,
+        accessToken,
+        token: accessToken,
+      },
+      user
+    );
+    setStatus('An existing Continental ID session is ready on this device.', 'success');
+    return true;
+  } catch {
+    setStatus('', 'info');
+    return false;
+  }
+};
+
 const requestAuth = async (endpoint, body, submitButton, labels) => {
   setBusy(submitButton, true, labels.idle, labels.busy);
   setStatus(endpoint === '/login' ? 'Checking your credentials...' : 'Creating your account...', 'info');
@@ -1120,6 +1289,7 @@ loginMfaBackBtn.addEventListener('click', () => {
 });
 
 const resetUrl = new URL('reset-password.html', window.location.href);
+if (popupAuthApp?.appId) resetUrl.searchParams.set('appId', popupAuthApp.appId);
 if (params.get('origin')) resetUrl.searchParams.set('origin', params.get('origin'));
 if (params.get('redirect')) resetUrl.searchParams.set('redirect', params.get('redirect'));
 if (params.get('apiBaseUrl')) resetUrl.searchParams.set('apiBaseUrl', params.get('apiBaseUrl'));
@@ -1131,6 +1301,24 @@ verificationResetBtn.addEventListener('click', () => {
 openFullPageLink.href = window.location.href;
 openFullPageLink.target = '_blank';
 openFullPageLink.rel = 'noopener noreferrer';
+
+sessionReuseContinueBtn.addEventListener('click', () => {
+  if (!reusableSessionPayload?.accessToken) {
+    hideReusableSession();
+    return;
+  }
+
+  setBusy(sessionReuseContinueBtn, true, 'Continue', 'Continuing...');
+  setStatus('Continuing with the active Continental ID session...', 'success');
+  finishAuth(reusableSessionPayload);
+});
+
+sessionReuseSwitchBtn.addEventListener('click', () => {
+  hideReusableSession();
+  switchTabs('login');
+  loginPasswordInput.value = '';
+  setStatus('Sign in with a different Continental ID account.', 'info');
+});
 
 if (loginPasskeyBtn) {
   loginPasskeyBtn.disabled = !window.WebAuthnJson?.isSupported?.();
@@ -1221,3 +1409,4 @@ resendVerificationBtn.addEventListener('click', handleResendVerification);
 updatePasswordStrength();
 showVerificationActions(false);
 resetLoginChallenge({ clearStatus: true });
+void attemptExistingSessionReuse();

@@ -32,4 +32,27 @@ window.__AUTH_CONFIG__ = {
   ],
   defaultDashboardOrigin: 'https://dashboard.continental-hub.com',
   hostedApiBaseUrl: 'https://auth.continental-hub.com',
+  authApps: {
+    grimoire: {
+      appId: 'grimoire',
+      displayName: 'Grimoire',
+      allowedOrigins: ['https://grimoire.continental-hub.com'],
+      allowedRedirectOrigins: ['https://grimoire.continental-hub.com'],
+      firstParty: true,
+    },
+    blueprint: {
+      appId: 'blueprint',
+      displayName: 'Blueprint',
+      allowedOrigins: ['https://blueprint.continental-hub.com'],
+      allowedRedirectOrigins: ['https://blueprint.continental-hub.com'],
+      firstParty: true,
+    },
+    vanguard: {
+      appId: 'vanguard',
+      displayName: 'Vanguard',
+      allowedOrigins: ['https://vanguard.continental-hub.com'],
+      allowedRedirectOrigins: ['https://vanguard.continental-hub.com'],
+      firstParty: true,
+    },
+  },
 };

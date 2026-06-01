@@ -18,6 +18,7 @@ process.env.ALLOW_LOCALHOST_ORIGINS = 'true';
 process.env.TRUST_PROXY = '1';
 
 const { app } = require('../server');
+const AuthApp = require('../models/AuthApp');
 const User = require('../models/User');
 const { dedupePasskeysAcrossUsers } = require('../utils/passkeyHardening');
 
@@ -25,7 +26,9 @@ const TEST_ORIGIN = 'http://localhost:3000';
 const TERRA_TRECK_PAGES_ORIGIN = 'https://charlemagne404.github.io';
 const BLUEPRINT_ORIGIN = 'https://blueprint.continental-hub.com';
 const DASHBOARD_ORIGIN = 'https://dashboard.continental-hub.com';
+const GRIMOIRE_ORIGIN = 'https://grimoire.continental-hub.com';
 const PULSE_ORIGIN = 'https://pulse.continental-hub.com';
+const VANGUARD_ORIGIN = 'https://vanguard.continental-hub.com';
 
 const sha256 = (value) =>
   crypto.createHash('sha256').update(String(value || '')).digest('hex');
@@ -126,6 +129,7 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
     .post('/api/auth/login')
     .set('Origin', PULSE_ORIGIN)
     .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'pulse.continental-hub.com')
     .send({
       identifier: 'pulse.user',
       password: 'StrongPass1',
@@ -139,7 +143,9 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
   assert.ok(loginResponse.body.auth.correlationId);
 
   const refreshCookie = getRefreshCookie(loginResponse);
+  const deviceCookie = getDeviceCookie(loginResponse);
   assert.ok(refreshCookie);
+  assert.match(deviceCookie, /;\s*Domain=continental-hub\.com/i);
 
   const refreshResponse = await request(app)
     .post('/api/auth/refresh_token')
@@ -151,6 +157,76 @@ test('Pulse hosted origin is trusted by popup config and can complete the refres
   assert.equal(refreshResponse.status, 200);
   assert.equal(refreshResponse.body.message, 'Session refreshed.');
   assert.ok(refreshResponse.body.accessToken);
+});
+
+test('localhost login keeps the device cookie host-only', async () => {
+  await createVerifiedUser({
+    email: 'localhost.device@example.com',
+    username: 'localhost.device',
+  });
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', TEST_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({
+      identifier: 'localhost.device',
+      password: 'StrongPass1',
+    });
+
+  assert.equal(loginResponse.status, 200);
+  assert.equal(loginResponse.body.authenticated, true);
+  assert.ok(getDeviceCookie(loginResponse));
+  assert.doesNotMatch(getDeviceCookie(loginResponse), /;\s*Domain=/i);
+});
+
+test('first-party hosted origins reuse the same known device across Continental ID sites', async () => {
+  const userAgent =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+  const user = await createVerifiedUser({
+    email: 'first.party.device@example.com',
+    username: 'first.party.device',
+  });
+
+  const pulseLoginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', PULSE_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'pulse.continental-hub.com')
+    .set('User-Agent', userAgent)
+    .send({
+      identifier: 'first.party.device',
+      password: 'StrongPass1',
+      deviceLabel: 'Continental Browser',
+    });
+
+  assert.equal(pulseLoginResponse.status, 200);
+  assert.equal(pulseLoginResponse.body.authenticated, true);
+  const sharedDeviceCookie = getDeviceCookie(pulseLoginResponse);
+  assert.ok(sharedDeviceCookie);
+  assert.match(sharedDeviceCookie, /;\s*Domain=continental-hub\.com/i);
+
+  const blueprintLoginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', BLUEPRINT_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'blueprint.continental-hub.com')
+    .set('User-Agent', userAgent)
+    .set('Cookie', [sharedDeviceCookie])
+    .send({
+      identifier: 'first.party.device',
+      password: 'StrongPass1',
+      deviceLabel: 'Continental Browser',
+    });
+
+  assert.equal(blueprintLoginResponse.status, 200);
+  assert.equal(blueprintLoginResponse.body.authenticated, true);
+
+  const updatedUser = await User.findById(user._id).lean();
+  assert.equal(updatedUser.knownDevices.length, 1);
+  assert.equal(updatedUser.auditEvents.length, 2);
+  assert.equal(updatedUser.auditEvents[0].meta?.newDevice, true);
+  assert.equal(updatedUser.auditEvents[1].meta?.newDevice, false);
 });
 
 test('Blueprint hosted origin is trusted consistently by popup config and backend CORS', async () => {
@@ -168,6 +244,220 @@ test('Blueprint hosted origin is trusted consistently by popup config and backen
   assert.equal(preflightResponse.status, 204);
   assert.equal(preflightResponse.headers['access-control-allow-origin'], BLUEPRINT_ORIGIN);
   assert.equal(preflightResponse.headers['access-control-allow-credentials'], 'true');
+});
+
+test('bootstrap succeeds with refresh cookie only for a registered app', async () => {
+  await createVerifiedUser({
+    email: 'bootstrap.cookie@example.com',
+    username: 'bootstrap.cookie',
+  });
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', BLUEPRINT_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'blueprint.continental-hub.com')
+    .send({
+      identifier: 'bootstrap.cookie',
+      password: 'StrongPass1',
+    });
+
+  assert.equal(loginResponse.status, 200);
+  const refreshCookie = getRefreshCookie(loginResponse);
+  assert.ok(refreshCookie);
+
+  const bootstrapResponse = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', BLUEPRINT_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'blueprint.continental-hub.com')
+    .set('Cookie', refreshCookie)
+    .send({
+      appId: 'blueprint',
+    });
+
+  assert.equal(bootstrapResponse.status, 200);
+  assert.equal(bootstrapResponse.body.authenticated, true);
+  assert.equal(bootstrapResponse.body.app.appId, 'blueprint');
+  assert.equal(bootstrapResponse.body.user.username, 'bootstrap.cookie');
+  assert.equal(bootstrapResponse.body.session.canRefresh, true);
+  assert.ok(bootstrapResponse.body.session.accessToken);
+  assert.equal(bootstrapResponse.body.auth.resultContractVersion, 2);
+});
+
+test('bootstrap succeeds with an inline access token only for a registered app', async () => {
+  await createVerifiedUser({
+    email: 'bootstrap.inline@example.com',
+    username: 'bootstrap.inline',
+  });
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', GRIMOIRE_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'grimoire.continental-hub.com')
+    .send({
+      identifier: 'bootstrap.inline',
+      password: 'StrongPass1',
+    });
+
+  assert.equal(loginResponse.status, 200);
+  assert.ok(loginResponse.body.accessToken);
+
+  const bootstrapResponse = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', GRIMOIRE_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({
+      appId: 'grimoire',
+      accessToken: loginResponse.body.accessToken,
+    });
+
+  assert.equal(bootstrapResponse.status, 200);
+  assert.equal(bootstrapResponse.body.authenticated, true);
+  assert.equal(bootstrapResponse.body.app.appId, 'grimoire');
+  assert.equal(bootstrapResponse.body.user.email, 'bootstrap.inline@example.com');
+  assert.equal(bootstrapResponse.body.session.canRefresh, false);
+  assert.equal(bootstrapResponse.body.accessToken, loginResponse.body.accessToken);
+});
+
+test('bootstrap returns a machine-readable error for unknown apps', async () => {
+  const response = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', TEST_ORIGIN)
+    .send({
+      appId: 'does-not-exist',
+    });
+
+  assert.equal(response.status, 404);
+  assert.equal(response.body.error.code, 'auth/app-unknown');
+});
+
+test('bootstrap rejects disabled registered apps', async () => {
+  await AuthApp.create({
+    appId: 'disabled-app',
+    displayName: 'Disabled App',
+    status: 'disabled',
+    allowedOrigins: ['http://localhost:3000'],
+    allowedRedirectOrigins: ['http://localhost:3000'],
+    requiredLinkedProviders: [],
+    policyResolver: null,
+    dashboardUrl: 'http://localhost:3000',
+    firstParty: false,
+  });
+
+  const response = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', TEST_ORIGIN)
+    .send({
+      appId: 'disabled-app',
+    });
+
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error.code, 'auth/app-disabled');
+});
+
+test('bootstrap returns a Discord-link requirement for Vanguard when the account is unlinked', async () => {
+  await createVerifiedUser({
+    email: 'vanguard.unlinked@example.com',
+    username: 'vanguard.unlinked',
+  });
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', VANGUARD_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'vanguard.continental-hub.com')
+    .send({
+      identifier: 'vanguard.unlinked',
+      password: 'StrongPass1',
+    });
+
+  const bootstrapResponse = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', VANGUARD_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({
+      appId: 'vanguard',
+      accessToken: loginResponse.body.accessToken,
+    });
+
+  assert.equal(bootstrapResponse.status, 200);
+  assert.equal(bootstrapResponse.body.authenticated, true);
+  assert.deepEqual(bootstrapResponse.body.requirements, ['link_discord']);
+  assert.equal(bootstrapResponse.body.appAccess.allowed, false);
+  assert.equal(bootstrapResponse.body.appAccess.reasonCode, 'auth/discord-unlinked');
+  assert.deepEqual(bootstrapResponse.body.appAccess.capabilities, []);
+});
+
+test('bootstrap returns Vanguard control-center access when Discord is linked', async () => {
+  const user = await createVerifiedUser({
+    email: 'vanguard.linked@example.com',
+    username: 'vanguard.linked',
+  });
+
+  user.linkedAccounts.discord = 'linked-user';
+  user.oauthIdentities.push({
+    provider: 'discord',
+    providerUserId: '1234567890',
+    username: 'linked-user',
+    email: 'vanguard.linked@example.com',
+    emailVerified: true,
+    avatarUrl: 'https://cdn.example.com/discord.png',
+    linkedAt: new Date(),
+    lastUsedAt: new Date(),
+  });
+  await user.save();
+
+  const loginResponse = await request(app)
+    .post('/api/auth/login')
+    .set('Origin', VANGUARD_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .set('X-Forwarded-Host', 'vanguard.continental-hub.com')
+    .send({
+      identifier: 'vanguard.linked',
+      password: 'StrongPass1',
+    });
+
+  const bootstrapResponse = await request(app)
+    .post('/api/auth/bootstrap')
+    .set('Origin', VANGUARD_ORIGIN)
+    .set('X-Forwarded-Proto', 'https')
+    .send({
+      appId: 'vanguard',
+      accessToken: loginResponse.body.accessToken,
+    });
+
+  assert.equal(bootstrapResponse.status, 200);
+  assert.equal(bootstrapResponse.body.authenticated, true);
+  assert.deepEqual(bootstrapResponse.body.requirements, []);
+  assert.equal(bootstrapResponse.body.linkedAccounts.discord.linked, true);
+  assert.equal(bootstrapResponse.body.linkedAccounts.discord.providerUserId, '1234567890');
+  assert.equal(bootstrapResponse.body.appAccess.allowed, true);
+  assert.deepEqual(bootstrapResponse.body.appAccess.capabilities, ['control_center']);
+});
+
+test('OAuth start rejects app/origin mismatches for registered apps', async () => {
+  const previousClientId = process.env.GITHUB_CLIENT_ID;
+  const previousClientSecret = process.env.GITHUB_CLIENT_SECRET;
+  process.env.GITHUB_CLIENT_ID = 'test-client-id';
+  process.env.GITHUB_CLIENT_SECRET = 'test-client-secret';
+
+  try {
+    const response = await request(app)
+      .get('/api/auth/oauth/github/start')
+      .query({
+        appId: 'grimoire',
+        origin: BLUEPRINT_ORIGIN,
+        redirect: `${BLUEPRINT_ORIGIN}/auth/complete`,
+      });
+
+    assert.equal(response.status, 403);
+    assert.match(response.text, /not allowed for this Continental auth app/i);
+  } finally {
+    process.env.GITHUB_CLIENT_ID = previousClientId;
+    process.env.GITHUB_CLIENT_SECRET = previousClientSecret;
+  }
 });
 
 test('Dashboard hosted origin remains trusted by backend CORS', async () => {
