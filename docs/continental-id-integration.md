@@ -10,6 +10,11 @@ The main point is simple:
 - centralize auth state in one place
 - treat provider failures, origin mismatches, and refresh failures as normal cases that must be handled explicitly
 
+For first-party Continental sites under `*.continental-hub.com`, two extra rules now apply:
+
+- device identity is shared across first-party subdomains, so the same browser should stay recognized as the same known device
+- the login popup should try `POST /api/auth/refresh_token` and then `GET /api/auth/me` before asking for credentials, so it can offer a lightweight "Continue as ..." step when a Continental session already exists on the device
+
 ## Reliability First
 
 The most common Continental ID failures are not bad passwords or bad JWT code. They are deployment and browser-behavior failures:
@@ -34,6 +39,7 @@ Use this model unless you have a strong reason not to:
 5. The frontend stores the access token in memory only.
 6. The refresh token stays in an `HttpOnly` cookie.
 7. The app retries once after `401`, then signs the user out or moves to a degraded state.
+8. First-party popup flows should attempt session reuse through `refresh_token` plus `/me` before rendering credential entry.
 
 Example:
 
@@ -164,6 +170,18 @@ Important:
 - remove it from the URL with `history.replaceState`
 - never leave access tokens sitting in the address bar longer than necessary
 
+### First-party popup session reuse
+
+For first-party `*.continental-hub.com` sites, the popup should do this on load:
+
+1. probe the configured auth API base
+2. call `POST /api/auth/refresh_token` with credentials
+3. if refresh returns `authenticated: true`, call `GET /api/auth/me` with the returned bearer token
+4. render a lightweight confirmation state such as `Continue as Alex Mercer`
+5. only fall back to the full login form when there is no active session or the refresh response says the session cannot be reused
+
+Do not log out the shared Continental session just because the user wants to switch accounts. Let the popup reveal the normal login form instead.
+
 ## Required API Behavior
 
 Continental ID exposes a session-oriented auth API. Integrations should expect these behaviors.
@@ -188,6 +206,8 @@ Expected outcomes:
 - `200` with `authenticated: false` and a machine-readable auth error when no valid refresh session exists
 
 Do not assume refresh failures always return `401`. Continental ID intentionally returns structured auth state so the frontend can downgrade gracefully instead of throwing raw transport errors.
+
+For first-party login popups, a successful refresh should be treated as "an existing session is available for confirmation", not as an automatic full-page sign-in.
 
 ### Session profile
 
@@ -258,6 +278,14 @@ Use this exact order:
 2. otherwise try refresh
 3. if refresh succeeds, load `/me`
 4. if `/me` fails once after refresh, try one more refresh
+
+## Manual Verification
+
+- Sign in to one first-party Continental site on a fresh browser and confirm the first login creates one known device and one new-device alert.
+- Open the login popup from another `*.continental-hub.com` site on the same browser and confirm the popup shows a `Continue as ...` confirmation instead of the credential form.
+- Continue with the existing session and confirm the relying-party site completes sign-in without another new-device alert.
+- Reopen the popup and choose `Use a different account`; confirm the normal login form appears without logging out the existing shared session first.
+- Open the popup with no refresh session and confirm the normal login/register flow still appears.
 5. if refresh still fails, move to signed-out or degraded state
 
 This prevents "signed in, but no session" dead ends.

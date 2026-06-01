@@ -92,10 +92,11 @@ test('hosted frontend probes only accept healthy auth API responses', () => {
   }
 });
 
-test('hosted login popup can recover the caller origin from redirect urls', () => {
+test('hosted login popup supports registered auth apps and existing session reuse', () => {
   const popupSource = fs.readFileSync(path.join(repoRoot, 'frontend/login/popup.js'), 'utf8');
 
-  assert.match(popupSource, /resolveTrustedOrigin\(params\.get\('redirect'\)\)/);
+  assert.match(popupSource, /params\.get\('appId'\)/);
+  assert.match(popupSource, /attemptExistingSessionReuse\(\)/);
 });
 
 test('login site is hosted from the continental id repo and exposes a local install path', () => {

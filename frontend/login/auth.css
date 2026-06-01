@@ -203,6 +203,66 @@ body.auth-page {
   line-height: 1.55;
 }
 
+.session-reuse-card {
+  margin-bottom: 18px;
+  padding: 20px;
+  border: 1px solid var(--auth-border-strong);
+  border-radius: var(--auth-radius-lg);
+  background:
+    linear-gradient(180deg, rgba(108, 132, 175, 0.12), rgba(18, 31, 49, 0.38)),
+    rgba(17, 29, 45, 0.92);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.session-reuse-card[hidden] {
+  display: none;
+}
+
+.session-reuse-card h3 {
+  margin: 0;
+  font-family: var(--auth-font-display);
+  font-size: 1.5rem;
+  line-height: 1.15;
+}
+
+.session-reuse-copy {
+  margin: 10px 0 0;
+  color: var(--auth-text-soft);
+  line-height: 1.6;
+}
+
+.session-reuse-summary {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(176, 194, 220, 0.14);
+  border-radius: var(--auth-radius-md);
+  background: rgba(7, 15, 26, 0.48);
+}
+
+.session-reuse-name,
+.session-reuse-email {
+  margin: 0;
+}
+
+.session-reuse-name {
+  font-size: 1.02rem;
+  font-weight: 800;
+  color: var(--auth-brand-ink);
+}
+
+.session-reuse-email {
+  margin-top: 6px;
+  color: var(--auth-text-soft);
+  word-break: break-word;
+}
+
+.session-reuse-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
 .auth-tabs {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

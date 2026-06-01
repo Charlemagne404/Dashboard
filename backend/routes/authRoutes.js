@@ -10,6 +10,7 @@ router.post('/register', ctrl.register);
 router.post('/login', ctrl.login);
 router.post('/logout', ctrl.logout);
 router.post('/refresh_token', ctrl.refreshToken);
+router.post('/bootstrap', ctrl.bootstrap);
 router.post('/request-password-reset', ctrl.requestPasswordReset);
 router.post('/resend-verification-public', ctrl.publicResendVerificationEmail);
 router.post('/reset-password', ctrl.resetPassword);
