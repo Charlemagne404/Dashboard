@@ -1,0 +1,251 @@
+name: Continental ecosystem integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      dashboard_ref: { description: "Dashboard commit SHA (40 hex characters)", required: true, type: string }
+      blueprint_ref: { description: "Blueprint commit SHA (40 hex characters)", required: true, type: string }
+      status_ref: { description: "Status commit SHA (40 hex characters)", required: true, type: string }
+      contact_ref: { description: "Contact commit SHA (40 hex characters)", required: true, type: string }
+      pulse_ref: { description: "Pulse commit SHA (40 hex characters)", required: true, type: string }
+      aegis_ref: { description: "Aegis commit SHA (40 hex characters)", required: true, type: string }
+      ai_ref: { description: "Ai commit SHA (40 hex characters)", required: true, type: string }
+      vanguard_ref: { description: "Vanguard commit SHA (40 hex characters)", required: true, type: string }
+      continental_id_client_ref: { description: "Continental ID client commit SHA (40 hex characters)", required: true, type: string }
+      grimoire_ref: { description: "Grimoire commit SHA (40 hex characters)", required: true, type: string }
+      stepcast_ref: { description: "StepCast commit SHA (40 hex characters)", required: true, type: string }
+      terra_treck_ref: { description: "Terra-Treck commit SHA (40 hex characters)", required: true, type: string }
+  workflow_call:
+    inputs:
+      dashboard_ref: { description: "Dashboard commit SHA (40 hex characters)", required: true, type: string }
+      blueprint_ref: { description: "Blueprint commit SHA (40 hex characters)", required: true, type: string }
+      status_ref: { description: "Status commit SHA (40 hex characters)", required: true, type: string }
+      contact_ref: { description: "Contact commit SHA (40 hex characters)", required: true, type: string }
+      pulse_ref: { description: "Pulse commit SHA (40 hex characters)", required: true, type: string }
+      aegis_ref: { description: "Aegis commit SHA (40 hex characters)", required: true, type: string }
+      ai_ref: { description: "Ai commit SHA (40 hex characters)", required: true, type: string }
+      vanguard_ref: { description: "Vanguard commit SHA (40 hex characters)", required: true, type: string }
+      continental_id_client_ref: { description: "Continental ID client commit SHA (40 hex characters)", required: true, type: string }
+      grimoire_ref: { description: "Grimoire commit SHA (40 hex characters)", required: true, type: string }
+      stepcast_ref: { description: "StepCast commit SHA (40 hex characters)", required: true, type: string }
+      terra_treck_ref: { description: "Terra-Treck commit SHA (40 hex characters)", required: true, type: string }
+    secrets:
+      ECOSYSTEM_REPOSITORY_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate pinned repository revisions
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: |
+          node <<'NODE'
+          const values = JSON.parse(process.env.INPUTS_JSON);
+          const fields = [
+            'dashboard_ref', 'blueprint_ref', 'status_ref', 'contact_ref', 'pulse_ref',
+            'aegis_ref', 'ai_ref', 'vanguard_ref', 'continental_id_client_ref',
+            'grimoire_ref', 'stepcast_ref', 'terra_treck_ref',
+          ];
+          for (const field of fields) {
+            if (!/^[0-9a-f]{40}$/i.test(String(values[field] || ''))) {
+              throw new Error(`${field} must be a full 40-character commit SHA`);
+            }
+          }
+          NODE
+
+      - name: Check out Dashboard
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/Dashboard
+          ref: ${{ inputs.dashboard_ref }}
+          path: repos/Dashboard
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Blueprint
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/blueprint
+          ref: ${{ inputs.blueprint_ref }}
+          path: repos/blueprint
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Status
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/status
+          ref: ${{ inputs.status_ref }}
+          path: repos/status
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Contact
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/contact
+          ref: ${{ inputs.contact_ref }}
+          path: repos/contact
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Pulse
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/pulse
+          ref: ${{ inputs.pulse_ref }}
+          path: repos/pulse
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Aegis
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/Aegis
+          ref: ${{ inputs.aegis_ref }}
+          path: repos/Aegis
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Ai
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/ai
+          ref: ${{ inputs.ai_ref }}
+          path: repos/Ai
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Vanguard
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/Vanguard
+          ref: ${{ inputs.vanguard_ref }}
+          path: repos/discord-bots
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out the shared Continental ID client
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/continental-id-client
+          ref: ${{ inputs.continental_id_client_ref }}
+          path: repos/continental-id-client
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Grimoire
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/Grimoire
+          ref: ${{ inputs.grimoire_ref }}
+          path: repos/Grimoire
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out StepCast
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/StepCast
+          ref: ${{ inputs.stepcast_ref }}
+          path: repos/StepCast
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Check out Terra-Treck
+        uses: actions/checkout@v4
+        with:
+          repository: Charlemagne404/Terra-Treck
+          ref: ${{ inputs.terra_treck_ref }}
+          path: repos/Terra-Treck
+          token: ${{ secrets.ECOSYSTEM_REPOSITORY_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci --prefix repos/Dashboard/backend
+          npm ci --prefix repos/blueprint
+          npm ci --prefix repos/status
+          npm ci --prefix repos/contact
+          npm ci --prefix repos/pulse
+          npm ci --prefix repos/Ai
+          npm ci --prefix repos/Grimoire
+          npm ci --prefix repos/StepCast/backend
+          npm ci --prefix repos/Terra-Treck/backend
+
+      - name: Set up Vanguard Python dependencies
+        run: |
+          python3 -m venv repos/discord-bots/.venv
+          repos/discord-bots/.venv/bin/python -m pip install --upgrade pip
+          repos/discord-bots/.venv/bin/pip install -r repos/discord-bots/requirements.txt
+
+      - name: Install Chromium for the real browser journey
+        working-directory: repos/blueprint
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Dashboard authentication tests and checks
+        run: |
+          npm --prefix repos/Dashboard/backend run check
+          npm --prefix repos/Dashboard/backend run lint
+          npm --prefix repos/Dashboard/backend run typecheck
+          npm --prefix repos/Dashboard/backend test
+
+      - name: Run Blueprint tests and checks
+        run: |
+          npm --prefix repos/blueprint run check:syntax
+          npm --prefix repos/blueprint run lint
+          npm --prefix repos/blueprint run check:types
+          npm --prefix repos/blueprint test
+
+      - name: Run Status tests and checks
+        run: |
+          npm --prefix repos/status run typecheck
+          npm --prefix repos/status run lint
+          npm --prefix repos/status test
+
+      - name: Run Pulse, Aegis, Ai, and Grimoire tests and checks
+        run: |
+          npm --prefix repos/pulse test
+          npm --prefix repos/Aegis test
+          npm --prefix repos/Ai run check
+          npm --prefix repos/Grimoire test
+          npm --prefix repos/Grimoire run build:server
+          npm --prefix repos/Grimoire run lint
+
+      - name: Run StepCast and Terra-Treck tests and checks
+        run: |
+          npm --prefix repos/StepCast/backend run check
+          npm --prefix repos/Terra-Treck/backend run check
+          npm --prefix repos/Terra-Treck/backend test
+
+      - name: Run isolated ecosystem contracts, browser, and chaos tiers
+        run: npm --prefix repos/Dashboard/ecosystem run test:all
+        env:
+          ECOSYSTEM_ROOT: ${{ github.workspace }}/repos
+          ECOSYSTEM_UPLOAD_SCREENSHOTS: "true"
+
+      - name: Collect sanitized evidence
+        if: always()
+        run: node repos/Dashboard/ecosystem/collect-evidence.cjs artifacts/ecosystem
+        env:
+          ECOSYSTEM_UPLOAD_SCREENSHOTS: "true"
+
+      - name: Upload sanitized reports and fixture screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continental-ecosystem-evidence
+          path: artifacts/ecosystem/
+          if-no-files-found: ignore
+          retention-days: 7

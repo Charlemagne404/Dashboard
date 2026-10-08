@@ -7,6 +7,7 @@ window.__AUTH_CONFIG__ = {
     'https://login.continental-hub.com',
     'https://pulse.continental-hub.com',
     'https://stepcast.continental-hub.com',
+    'https://status.continental-hub.com',
     'https://vanguard.continental-hub.com',
     'https://charlemagne404.github.io',
     'https://mpmc.ddns.net',
@@ -33,6 +34,9 @@ window.__AUTH_CONFIG__ = {
   defaultDashboardOrigin: 'https://dashboard.continental-hub.com',
   hostedApiBaseUrl: 'https://auth.continental-hub.com',
   authApps: {
+    status: { appId: 'status', displayName: 'Status',
+      allowedOrigins: ['https://status.continental-hub.com'],
+      allowedRedirectOrigins: ['https://status.continental-hub.com'], firstParty: true },
     grimoire: {
       appId: 'grimoire',
       displayName: 'Grimoire',

@@ -23,8 +23,22 @@ const loadServerConfig = (env = {}) => {
     env: {
       ...process.env,
       MONGO_URI: 'mongodb://127.0.0.1:27017/runtime_config_test',
+      DOTENV_CONFIG_PATH: '/tmp/continental-nonexistent-fixture-env',
+      ALLOW_DEFAULT_TRUSTED_ORIGINS: 'false',
       JWT_SECRET: '12345678901234567890123456789012',
       REFRESH_TOKEN_SECRET: 'abcdefghijklmnopqrstuvwxyz123456',
+      MFA_SECRET_ENCRYPTION_KEY: 'fixture-mfa-encryption-key-123456789',
+      ALLOWED_ORIGINS: 'https://dashboard.example.test,https://login.example.test',
+      IDENTITY_MANAGEMENT_ORIGINS: 'https://dashboard.example.test,https://login.example.test',
+      PUBLIC_API_ORIGIN: 'https://login.example.test',
+      TRUST_PROXY: '1',
+      RESEND_API_KEY: 'fixture-not-a-live-email-key',
+      EMAIL_FROM: 'test@example.test',
+      LOGIN_POPUP_URL: 'https://login.example.test/popup.html',
+      GITHUB_CLIENT_ID: '', GITHUB_CLIENT_SECRET: '',
+      GOOGLE_CLIENT_ID: '', GOOGLE_CLIENT_SECRET: '',
+      MICROSOFT_CLIENT_ID: '', MICROSOFT_CLIENT_SECRET: '',
+      DISCORD_CLIENT_ID: '', DISCORD_CLIENT_SECRET: '',
       ...env,
     },
     encoding: 'utf8',
@@ -34,7 +48,7 @@ const loadServerConfig = (env = {}) => {
   return JSON.parse(result.stdout.trim());
 };
 
-test('production defaults bind publicly without auto-enabling HTTPS', () => {
+test('production supports HTTP behind an explicitly trusted TLS proxy', () => {
   const config = loadServerConfig({
     NODE_ENV: 'production',
     HOST: '',
@@ -66,14 +80,19 @@ test('compose defaults are aligned with local container development', () => {
   assert.match(composeSource, /HTTPS_MODE:\s*off/);
 });
 
-test('deploy helper can fall back to a direct HTTPS health probe', () => {
+test('deploy helper validates and syncs the tested release into the systemd deployment directory', () => {
   const deployScriptSource = fs.readFileSync(
     path.join(repoRoot, 'backend/deploy-backend.sh'),
     'utf8'
   );
 
-  assert.match(deployScriptSource, /https:\/\/127\.0\.0\.1:5000\/api\/health/);
-  assert.match(deployScriptSource, /curl -kfsS/);
+  assert.match(deployScriptSource, /http:\/\/127\.0\.0\.1:5000\/api\/health/);
+  assert.match(deployScriptSource, /systemctl --user show .*WorkingDirectory/);
+  assert.match(deployScriptSource, /rsync -a --delete/);
+  assert.match(deployScriptSource, /npm ci --omit=dev/);
+  assert.match(deployScriptSource, /assertRuntimeConfig/);
+  assert.match(deployScriptSource, /--exclude='\.env'/);
+  assert.doesNotMatch(deployScriptSource, /curl -kfsS/);
 });
 
 test('hosted frontend probes only accept healthy auth API responses', () => {

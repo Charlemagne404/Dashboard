@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const { hashPassword, comparePassword, BCRYPT_COST } = require('../utils/passwords');
 
 const loginEventSchema = new mongoose.Schema(
   {
@@ -21,6 +22,8 @@ const loginDayCountSchema = new mongoose.Schema(
 const refreshSessionSchema = new mongoose.Schema(
   {
     sid: { type: String, required: true },
+    identityManagement: { type: Boolean, default: false },
+    applicationOrigin: { type: String, default: '', maxlength: 2000 },
     label: { type: String, default: '' },
     createdAt: { type: Date, default: Date.now },
     lastUsedAt: { type: Date, default: Date.now },
@@ -287,6 +290,7 @@ const userSchema = new mongoose.Schema(
         pendingCreatedAt: { type: Date, default: null },
         enrolledAt: { type: Date, default: null },
         lastUsedAt: { type: Date, default: null },
+        lastAcceptedStep: { type: Number, default: -1 },
       },
       passkeys: {
         type: [passkeySchema],
@@ -296,6 +300,7 @@ const userSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
+    optimisticConcurrency: true,
   }
 );
 
@@ -307,6 +312,15 @@ userSchema.index(
 userSchema.index({ accountRole: 1, accountStatus: 1, updatedAt: -1 });
 
 userSchema.pre('save', async function onSave(next) {
+  if (!this.isNew && !this.isModified('refreshTokenVersion') && (
+    this.isModified('password') || this.isModified('accountRole') ||
+    this.isModified('accountStatus') || this.isModified('email') ||
+    (this.isModified('isVerified') && !this.isVerified) ||
+    this.isModified('security.mfa.enabled') || this.isModified('security.mfa.secret')
+  )) {
+    this.refreshTokenVersion += 1;
+    this.refreshSessions = [];
+  }
   if (!this.displayName && this.email) {
     const [localPart] = String(this.email).split('@');
     this.displayName = localPart || 'User';
@@ -316,13 +330,26 @@ userSchema.pre('save', async function onSave(next) {
     return next();
   }
 
-  this.password = await bcrypt.hash(this.password, 10);
+  this.password = await hashPassword(this.password);
   this.security.passwordChangedAt = new Date();
   return next();
 });
 
-userSchema.methods.comparePassword = function comparePassword(candidate) {
-  return bcrypt.compare(candidate, this.password);
+userSchema.methods.comparePassword = async function checkPassword(candidate) {
+  const matches = await comparePassword(candidate, this.password);
+  if (matches && bcrypt.getRounds(this.password) < BCRYPT_COST) {
+    // Do not save a stale user or revoke sessions just to upgrade a work factor.
+    const upgraded = await hashPassword(candidate);
+    const result = await this.constructor.updateOne(
+      { _id: this._id, password: this.password, __v: this.__v },
+      { $set: { password: upgraded }, $inc: { __v: 1 } }
+    );
+    if (!result.modifiedCount) throw new mongoose.Error.VersionError(this, this.__v, ['password']);
+    this.password = upgraded;
+    this.unmarkModified('password');
+    this.__v += 1;
+  }
+  return matches;
 };
 
 module.exports = mongoose.model('User', userSchema);

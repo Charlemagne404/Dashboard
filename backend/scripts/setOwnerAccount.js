@@ -33,11 +33,16 @@ const run = async () => {
     if (!user) {
       throw new Error(`No user found for ${email}.`);
     }
+    if (!demote && (!user.isVerified || user.accountStatus !== 'active')) {
+      throw new Error('Owner promotion requires a verified, active account.');
+    }
+    if (demote && user.accountRole === 'owner' && !(await User.exists({
+      _id: { $ne: user._id }, accountRole: 'owner', accountStatus: 'active',
+    }))) throw new Error('An active owner must remain.');
 
     user.accountRole = demote ? 'user' : 'owner';
-    if (!demote) {
-      user.accountStatus = 'active';
-    }
+    user.auditEvents.push({ type: 'owner_role_changed', message: 'Owner authority updated by local operator.', meta: { role: user.accountRole } });
+    user.auditEvents = user.auditEvents.slice(-120);
     await user.save();
 
     console.log(

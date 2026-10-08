@@ -7,18 +7,28 @@ const {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } = require('@simplewebauthn/server');
-const { isoBase64URL, isoUint8Array } = require('@simplewebauthn/server/helpers');
+const { isoUint8Array } = require('@simplewebauthn/server/helpers');
 const ApiRateLimitBucket = require('../models/ApiRateLimitBucket');
 const LoginThrottle = require('../models/LoginThrottle');
 const User = require('../models/User');
+const { deleteAccountRecord } = require('../utils/accountDeletion');
 const sendEmail = require('../utils/email');
+const { logError } = require('../utils/safeLog');
+const { comparePassword, hashPassword, isAcceptablePasswordInput } = require('../utils/passwords');
+const { isSessionActive, SESSION_ABSOLUTE_TTL_MS } = require('../utils/sessionPolicy');
+const { getClientIpKey } = require('../utils/clientIp');
+const { isIdentityManagementOrigin } = require('../utils/identityScope');
+const { scriptJson } = require('../utils/browserSecurity');
+const ms = require('ms');
+const AuthChallenge = require('../models/AuthChallenge');
+const { newTransaction, consumeTransaction, verifyIdToken } = require('../utils/oauthSecurity');
 const { createEmailVerificationToken } = require('../utils/emailVerification');
 const {
   buildOtpAuthQrDataUrl,
   buildOtpAuthUrl,
   generateBackupCodes,
   generateMfaSecret,
-  verifyTotp,
+  getTotpStep,
 } = require('../utils/mfa');
 const {
   decryptMfaSecret,
@@ -50,7 +60,6 @@ const {
 const { buildVanguardAccountState } = require('../utils/vanguardIntegration');
 const {
   ACCOUNT_ROLE_OWNER,
-  ACCOUNT_ROLE_USER,
   ACCOUNT_STATUS_ACTIVE,
   ACCOUNT_STATUS_SUSPENDED,
   buildAuthorityPayload,
@@ -58,12 +67,13 @@ const {
   isSuspendedAccount,
   normalizeAccountRole,
   normalizeAccountStatus,
-  shouldAutoGrantOwnerRole,
 } = require('../utils/accountAccess');
+const AuthApp = require('../models/AuthApp');
 const { findRegisteredAuthApp } = require('../utils/authApps');
 
 const ACCESS_TOKEN_TTL = process.env.JWT_EXPIRES_IN || '15m';
 const REFRESH_TOKEN_TTL = process.env.REFRESH_TOKEN_EXPIRES_IN || '7d';
+const REFRESH_COOKIE_NAME = process.env.NODE_ENV === 'production' ? '__Host-continentalRefresh' : 'refreshToken';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_RECENT_LOGIN_EVENTS = 50;
@@ -108,7 +118,7 @@ const EMAIL_MONTHLY_LIMIT = Number(process.env.EMAIL_MONTHLY_LIMIT) || 3000;
 const NEW_DEVICE_SESSION_WINDOW_MS = 15 * 60 * 1000;
 const MAX_PASSKEYS = 20;
 const DEVICE_ID_COOKIE = 'deviceId';
-const WEBAUTHN_CHALLENGE_COOKIE = 'webauthnChallenge';
+const WEBAUTHN_CHALLENGE_COOKIE = process.env.NODE_ENV === 'production' ? '__Host-webauthnChallenge' : 'webauthnChallenge';
 const DEVICE_ID_TTL_MS = Number(process.env.DEVICE_ID_TTL_MS) || 365 * DAY_MS;
 const WEBAUTHN_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || 'Continental ID';
@@ -183,6 +193,7 @@ const DEFAULT_OAUTH_APP_ORIGINS = [
   'https://charlemagne404.github.io',
   'https://grimoire.continental-hub.com',
   'https://stepcast.continental-hub.com',
+  'https://terra-tread.continental-hub.com',
   'https://mpmc.ddns.net',
 ];
 const configuredOauthAppOrigins = Array.from(
@@ -196,7 +207,7 @@ const configuredOauthAppOrigins = Array.from(
   )
 );
 const allowDefaultOauthAppOrigins =
-  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'true') !== 'false';
+  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || (process.env.NODE_ENV === 'production' ? 'false' : 'true')) !== 'false';
 const OAUTH_APP_ORIGINS = new Set([
   ...(allowDefaultOauthAppOrigins ? DEFAULT_OAUTH_APP_ORIGINS : []),
   ...configuredOauthAppOrigins,
@@ -261,7 +272,7 @@ const sanitizeDisplayName = (displayName, email = '') => {
 };
 
 const isStrongPassword = (password) => {
-  if (typeof password !== 'string') return false;
+  if (!isAcceptablePasswordInput(password)) return false;
   if (password.length < 8) return false;
 
   const hasUppercase = /[A-Z]/.test(password);
@@ -276,9 +287,6 @@ const parseClientIp = (req) => {
 };
 
 const parseUserAgent = (req) => sanitizeText(req.headers['user-agent'] || 'Unknown browser/device', 300);
-
-const buildLoginThrottleExpiry = (now = Date.now()) =>
-  new Date(now + Math.max(LOGIN_RATE_WINDOW_MS, LOGIN_BLOCK_MS) + 60_000);
 
 const isDuplicateKeyError = (err) => err?.code === 11000;
 const getDuplicateFieldName = (err) =>
@@ -315,6 +323,7 @@ const parseActivityDayStart = (value) => {
 const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const getRequestOrigin = (req) => {
+  if (process.env.NODE_ENV === 'production') return process.env.PUBLIC_API_ORIGIN;
   const forwardedProto = sanitizeText(
     String(req.headers['x-forwarded-proto'] || '').split(',')[0],
     20
@@ -547,7 +556,7 @@ const isTrustedOauthAppOrigin = (origin) => {
 
   try {
     const parsed = new URL(origin);
-    if (isLocalHostname(parsed.hostname)) return true;
+    if (isLocalHostname(parsed.hostname) && process.env.NODE_ENV !== 'production' && process.env.ALLOW_LOCALHOST_ORIGINS !== 'false') return true;
     return OAUTH_APP_ORIGINS.has(parsed.origin);
   } catch {
     return false;
@@ -620,7 +629,7 @@ const isAllowedAuthAppOrigin = (authApp, origin, field = 'allowedOrigins') => {
 
   try {
     const parsed = new URL(normalizedOrigin);
-    if (isLocalHostname(parsed.hostname)) {
+    if (isLocalHostname(parsed.hostname) && process.env.NODE_ENV !== 'production' && process.env.ALLOW_LOCALHOST_ORIGINS !== 'false') {
       return true;
     }
   } catch {
@@ -887,6 +896,9 @@ const resolveOauthCallbackUrl = (provider, req) => {
   };
   const explicit = resolveAbsoluteUrl(process.env[envKeyMap[normalized]]);
   if (explicit) return explicit;
+  if (process.env.NODE_ENV === 'production') {
+    throw createHttpError(503, 'OAuth callback URL must be explicitly configured.');
+  }
 
   const requestOrigin = getRequestOrigin(req);
   if (!requestOrigin) {
@@ -988,6 +1000,7 @@ const getMicrosoftOauthConfig = (req) => {
 
   return {
     provider: OAUTH_PROVIDER_MICROSOFT,
+    tenant,
     label: getOauthProviderLabel(OAUTH_PROVIDER_MICROSOFT),
     clientId,
     clientSecret,
@@ -1002,7 +1015,7 @@ const getMicrosoftOauthConfig = (req) => {
     tokenRequestFormat: 'form',
     requireAuthorizationCodeGrant: true,
     profileStrategy: 'oidc',
-    trustEmailWithoutExplicitVerification: true,
+    trustEmailWithoutExplicitVerification: false,
   };
 };
 
@@ -1155,12 +1168,13 @@ const removeOauthIdentity = (user, provider) => {
   return true;
 };
 
-const requestOauthAccessToken = async (config, code) => {
+const requestOauthAccessToken = async (config, code, verifier) => {
   const bodyPayload = {
     client_id: config.clientId,
     client_secret: config.clientSecret,
     code: sanitizeText(code, 4000),
     redirect_uri: config.callbackUrl,
+    code_verifier: verifier,
   };
   if (config.requireAuthorizationCodeGrant) {
     bodyPayload.grant_type = 'authorization_code';
@@ -1168,6 +1182,8 @@ const requestOauthAccessToken = async (config, code) => {
 
   const isFormRequest = config.tokenRequestFormat === 'form';
   const response = await fetch(config.tokenUrl, {
+    signal: AbortSignal.timeout(8000),
+    redirect: 'error',
     method: 'POST',
     headers: {
       Accept: 'application/json',
@@ -1181,13 +1197,7 @@ const requestOauthAccessToken = async (config, code) => {
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload?.access_token) {
-    throw createHttpError(
-      502,
-      payload?.error_description ||
-        payload?.error?.message ||
-        payload?.error ||
-        `${config.label} token exchange failed.`
-    );
+    throw createHttpError(502, `${config.label} token exchange failed.`);
   }
 
   return payload;
@@ -1200,13 +1210,13 @@ const requestGithubProfile = async (accessToken) => {
     'User-Agent': 'continental-id-auth',
   };
 
-  const profileResponse = await fetch('https://api.github.com/user', { headers });
+  const profileResponse = await fetch('https://api.github.com/user', { headers, signal: AbortSignal.timeout(8000), redirect: 'error' });
   const profile = await profileResponse.json().catch(() => ({}));
   if (!profileResponse.ok || !profile?.id) {
     throw createHttpError(502, 'GitHub profile request failed.');
   }
 
-  const emailResponse = await fetch('https://api.github.com/user/emails', { headers });
+  const emailResponse = await fetch('https://api.github.com/user/emails', { headers, signal: AbortSignal.timeout(8000), redirect: 'error' });
   const emails = await emailResponse.json().catch(() => []);
   const emailList = Array.isArray(emails) ? emails : [];
   const preferredEmail =
@@ -1229,6 +1239,7 @@ const requestGithubProfile = async (accessToken) => {
 
 const requestDiscordProfile = async (config, accessToken) => {
   const response = await fetch(config.userInfoUrl, {
+    signal: AbortSignal.timeout(8000), redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${accessToken}`,
@@ -1264,16 +1275,9 @@ const requestDiscordProfile = async (config, accessToken) => {
   };
 };
 
-const decodeOauthIdTokenClaims = (idToken) => {
-  const token = String(idToken || '').trim();
-  if (!token) return {};
-
-  const decoded = jwt.decode(token, { json: true });
-  return decoded && typeof decoded === 'object' ? decoded : {};
-};
-
 const requestOidcUserInfo = async (config, accessToken) => {
   const response = await fetch(config.userInfoUrl, {
+    signal: AbortSignal.timeout(8000), redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${accessToken}`,
@@ -1287,14 +1291,14 @@ const requestOidcUserInfo = async (config, accessToken) => {
   return payload;
 };
 
-const requestOidcProfile = async (config, tokenPayload) => {
+const requestOidcProfile = async (config, tokenPayload, nonce) => {
   const accessToken = String(tokenPayload?.access_token || '').trim();
   if (!accessToken) {
     throw createHttpError(502, `${config.label} token exchange did not return an access token.`);
   }
 
   const userInfo = await requestOidcUserInfo(config, accessToken);
-  const idTokenClaims = decodeOauthIdTokenClaims(tokenPayload?.id_token);
+  const idTokenClaims = await verifyIdToken(config, tokenPayload?.id_token, nonce, userInfo);
   const claims = {
     ...idTokenClaims,
     ...userInfo,
@@ -1309,7 +1313,7 @@ const requestOidcProfile = async (config, tokenPayload) => {
   const profileUrl = sanitizeText(claims.profile, 1000);
   const avatarUrl = sanitizeText(claims.picture, 1000);
   const emailVerified = hasOwn(claims, 'email_verified')
-    ? Boolean(claims.email_verified)
+    ? claims.email_verified === true
     : Boolean(email && config.trustEmailWithoutExplicitVerification);
 
   return {
@@ -1324,7 +1328,7 @@ const requestOidcProfile = async (config, tokenPayload) => {
   };
 };
 
-const requestOauthIdentityProfile = async (config, tokenPayload) => {
+const requestOauthIdentityProfile = async (config, tokenPayload, nonce) => {
   if (config.profileStrategy === 'github') {
     return requestGithubProfile(String(tokenPayload?.access_token || '').trim());
   }
@@ -1334,19 +1338,22 @@ const requestOauthIdentityProfile = async (config, tokenPayload) => {
   }
 
   if (config.profileStrategy === 'oidc') {
-    return requestOidcProfile(config, tokenPayload);
+    return requestOidcProfile(config, tokenPayload, nonce);
   }
 
   throw createHttpError(500, 'OAuth provider profile strategy is not configured.');
 };
 
-const buildOauthAuthorizeUrl = (config, state) => {
+const buildOauthAuthorizeUrl = (config, state, transaction) => {
   const authorizeUrl = new URL(config.authorizeUrl);
   authorizeUrl.searchParams.set('client_id', config.clientId);
   authorizeUrl.searchParams.set('redirect_uri', config.callbackUrl);
   authorizeUrl.searchParams.set('response_type', 'code');
   authorizeUrl.searchParams.set('scope', config.scopes.join(' '));
   authorizeUrl.searchParams.set('state', state);
+  authorizeUrl.searchParams.set('code_challenge', transaction.challenge);
+  authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+  if (config.profileStrategy === 'oidc') authorizeUrl.searchParams.set('nonce', transaction.nonce);
 
   if (config.authorizeParams && typeof config.authorizeParams === 'object') {
     for (const [key, value] of Object.entries(config.authorizeParams)) {
@@ -1744,9 +1751,9 @@ const renderOauthResultPage = ({
     </div>
   </main>
   <script>
-    const payload = ${JSON.stringify(messagePayload || null)};
-    const targetOrigin = ${JSON.stringify(targetOrigin || '')};
-    const redirectUrl = ${JSON.stringify(resolvedRedirectUrl)};
+    const payload = ${scriptJson(messagePayload || null)};
+    const targetOrigin = ${scriptJson(targetOrigin || '')};
+    const redirectUrl = ${scriptJson(resolvedRedirectUrl)};
     const closeWindow = ${JSON.stringify(Boolean(closeWindow))};
     const redirectDelayMs = ${JSON.stringify(redirectDelayMs)};
     const countdownEl = document.getElementById('redirect-countdown');
@@ -2480,25 +2487,18 @@ const reserveEmailQuotaWindow = async ({ key, windowStart, expiresAt, limit, amo
     return false;
   }
 
-  const entry = await ApiRateLimitBucket.findOneAndUpdate(
-    {
-      key,
-      windowStart,
-      count: { $lte: maxAllowedCount },
-    },
-    {
-      $setOnInsert: {
-        expiresAt,
-      },
-      $inc: {
-        count: normalizedAmount,
-      },
-    },
-    {
-      upsert: true,
-      new: true,
-    }
-  ).lean();
+  let entry;
+  const query = {
+    key, windowStart, count: { $lte: maxAllowedCount },
+  };
+  const update = { $setOnInsert: { expiresAt }, $inc: { count: normalizedAmount } };
+  try {
+    entry = await ApiRateLimitBucket.findOneAndUpdate(query, update, { upsert: true, new: true }).lean();
+  } catch (err) {
+    if (!isDuplicateKeyError(err)) throw err;
+    // Full quota and a simultaneous first reservation both cause unique-key conflicts.
+    entry = await ApiRateLimitBucket.findOneAndUpdate(query, update, { upsert: false, new: true }).lean();
+  }
 
   return Boolean(entry);
 };
@@ -2506,7 +2506,10 @@ const reserveEmailQuotaWindow = async ({ key, windowStart, expiresAt, limit, amo
 const rollbackEmailQuotaWindow = async ({ key, windowStart, amount = 1 }) => {
   const normalizedAmount = Math.max(1, Math.trunc(Number(amount || 1)));
   await ApiRateLimitBucket.updateOne(
-    { key, windowStart },
+    {
+      key,
+      windowStart,
+    },
     {
       $inc: {
         count: -normalizedAmount,
@@ -2595,7 +2598,7 @@ const deliverManagedEmail = async ({
     });
   };
 
-  let response = null;
+  let response;
   try {
     response = await sendEmail({
       to: recipients,
@@ -2613,7 +2616,7 @@ const deliverManagedEmail = async ({
     }
   } catch (err) {
     await rollbackReservation();
-    console.error('Managed email delivery error:', err);
+    logError('Managed email delivery error:', err);
     return { sent: false, reason: 'delivery_error' };
   }
 
@@ -2626,7 +2629,7 @@ const deliverManagedEmail = async ({
       await user.save();
     }
   } catch (err) {
-    console.error('Email post-send persistence error:', err);
+    logError('Email post-send persistence error:', err);
   }
 
   return {
@@ -2681,7 +2684,6 @@ const sendPasswordResetEmail = async (user, req, reset) => {
 };
 
 const buildSecurityEmailContent = ({ user = null, title, intro, details = [] }) => {
-  const safeTitle = escapeHtml(title || 'Security alert');
   const safeIntro = escapeHtml(intro || 'A security-sensitive action was detected on your account.');
   const normalizedDetails = Array.isArray(details)
     ? details.map((item) => sanitizeText(item, 240)).filter(Boolean)
@@ -3366,9 +3368,12 @@ const hashBackupCodes = (codes = []) =>
   codes.map((code) => hashBackupCodeForStorage(sanitizeBackupCode(code))).filter(Boolean);
 
 const getStoredMfaSecret = (user) => decryptMfaSecret(user?.security?.mfa?.secret);
-const getPendingMfaSecret = (user) => decryptMfaSecret(user?.security?.mfa?.pendingSecret);
+const getPendingMfaSecret = (user) => {
+  const created = new Date(user?.security?.mfa?.pendingCreatedAt || 0).getTime();
+  return created + 10 * 60 * 1000 > Date.now() ? decryptMfaSecret(user?.security?.mfa?.pendingSecret) : '';
+};
 const isMfaEnabledForUser = (user) =>
-  Boolean(user?.security?.mfa?.enabled && getStoredMfaSecret(user));
+  Boolean(user?.security?.mfa?.enabled);
 
 const buildMfaSetupPayload = async (user, secret, backupCodes) => {
   const otpAuthUrl = buildOtpAuthUrl({
@@ -3395,6 +3400,7 @@ const clearStoredMfaState = (user) => {
   user.security.mfa.pendingCreatedAt = null;
   user.security.mfa.enrolledAt = null;
   user.security.mfa.lastUsedAt = null;
+  user.security.mfa.lastAcceptedStep = -1;
 };
 
 const verifyBackupCode = (user, backupCode) => {
@@ -3411,21 +3417,21 @@ const verifyBackupCode = (user, backupCode) => {
     return { ok: false };
   }
 
-  user.security.mfa.backupCodes.splice(matchIndex, 1);
-  return { ok: true, usedBackupCode: normalized };
+  return { ok: true, storedHash: storedCodes[matchIndex] };
 };
 
 const verifyMfaAttempt = (user, { mfaCode = '', backupCode = '' } = {}) => {
   const secret = getStoredMfaSecret(user);
   const normalizedCode = sanitizeMfaCode(mfaCode);
 
-  if (normalizedCode && verifyTotp({ secret, token: normalizedCode })) {
-    return { ok: true, method: 'totp' };
+  const step = getTotpStep({ secret, token: normalizedCode });
+  if (step !== null && step > (user.security.mfa.lastAcceptedStep ?? -1)) {
+    return { ok: true, method: 'totp', step };
   }
 
   const backupResult = verifyBackupCode(user, backupCode);
   if (backupResult.ok) {
-    return { ok: true, method: 'backup_code', usedBackupCode: backupResult.usedBackupCode };
+    return { ok: true, method: 'backup_code', storedHash: backupResult.storedHash };
   }
 
   return { ok: false };
@@ -3738,40 +3744,41 @@ const resolveCookieDomain = (req) => {
 };
 
 const buildCookieOptions = (req) => {
-  const isSecure = getRequestOrigin(req).startsWith('https://');
+  const isSecure = process.env.NODE_ENV === 'production' || req.secure;
   const isCrossSite = isSecure && !isSameSiteRequest(req);
-  const domain = resolveCookieDomain(req);
 
   return {
     httpOnly: true,
     secure: isSecure,
     sameSite: isCrossSite ? 'None' : 'Lax',
     path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    ...(domain ? { domain } : {}),
+    maxAge: ms(REFRESH_TOKEN_TTL),
   };
 };
 
 const buildDeviceCookieOptions = (req) => {
   const cookieOptions = buildCookieOptions(req);
+  const domain = resolveCookieDomain(req);
   return {
     httpOnly: true,
     secure: cookieOptions.secure,
     sameSite: cookieOptions.sameSite,
     path: '/',
     maxAge: DEVICE_ID_TTL_MS,
-    ...(cookieOptions.domain ? { domain: cookieOptions.domain } : {}),
+    ...(domain ? { domain } : {}),
   };
 };
 
 const clearRefreshCookie = (res, req) => {
   const cookieOptions = buildCookieOptions(req);
-  res.clearCookie('refreshToken', {
+  res.clearCookie(REFRESH_COOKIE_NAME, {
     httpOnly: cookieOptions.httpOnly,
     secure: cookieOptions.secure,
     sameSite: cookieOptions.sameSite,
     path: cookieOptions.path,
   });
+  const domain = resolveCookieDomain(req);
+  if (domain) res.clearCookie('refreshToken', { ...cookieOptions, maxAge: undefined, domain });
 };
 
 const persistDeviceCookie = (res, req, deviceId = '', userAgent = '') => {
@@ -3812,7 +3819,7 @@ const buildWebAuthnChallengeCookieOptions = (req) => {
     httpOnly: true,
     secure: cookieOptions.secure,
     sameSite: cookieOptions.sameSite,
-    path: '/api/auth/passkeys',
+    path: '/',
     maxAge: WEBAUTHN_CHALLENGE_TTL_MS,
   };
 };
@@ -3827,10 +3834,15 @@ const clearWebAuthnChallengeCookie = (res, req) => {
   });
 };
 
-const storeWebAuthnChallenge = (res, req, payload) => {
+const storeWebAuthnChallenge = async (res, req, payload) => {
+  const id = crypto.randomBytes(32).toString('base64url');
+  await AuthChallenge.create({
+    _id: hashToken(id), kind: 'webauthn', expiresAt: new Date(Date.now() + WEBAUTHN_CHALLENGE_TTL_MS),
+  });
   const challengeToken = signTypedJwt({
     secret: process.env.JWT_SECRET,
     payload,
+    jwtid: id,
     expiresIn: Math.max(30, Math.floor(WEBAUTHN_CHALLENGE_TTL_MS / 1000)),
     audience: WEBAUTHN_CHALLENGE_AUDIENCE,
     type: 'webauthn_challenge',
@@ -3843,7 +3855,7 @@ const storeWebAuthnChallenge = (res, req, payload) => {
   );
 };
 
-const readWebAuthnChallenge = (req, expectedFlow = '') => {
+const readWebAuthnChallenge = async (req, expectedFlow = '') => {
   const token = sanitizeText(req.cookies?.[WEBAUTHN_CHALLENGE_COOKIE], 4000);
   if (!token) {
     throw createHttpError(400, 'This passkey request expired. Start again.');
@@ -3865,19 +3877,46 @@ const readWebAuthnChallenge = (req, expectedFlow = '') => {
     throw createHttpError(400, 'This passkey request does not match the expected step.');
   }
 
+  if (payload.origin !== extractBrowserOrigin(req) ||
+      (expectedFlow === 'registration' && (payload.sid !== req.user?.sid || payload.tokenVersion !== req.user?.tokenVersion))) {
+    throw createHttpError(400, 'Passkey request context changed. Start again.');
+  }
+  const consumed = await AuthChallenge.findOneAndDelete({
+    _id: hashToken(payload.jti), kind: 'webauthn', expiresAt: { $gt: new Date() },
+  });
+  if (!consumed) throw createHttpError(400, 'Passkey request expired or already used.');
+
   return payload;
 };
 
-const signToken = (user, sid) =>
+const sessionLifetimeSec = (user, sid, ttl) => {
+  const session = findRefreshSession(user, sid);
+  if (!session) throw createHttpError(401, 'Session expired or revoked.');
+  const remaining = new Date(session.createdAt).getTime() + SESSION_ABSOLUTE_TTL_MS - Date.now();
+  return Math.max(1, Math.min(Math.floor(ms(ttl) / 1000), Math.floor(remaining / 1000)));
+};
+
+const tokenTargetOrigin = (req) => {
+  const browserOrigin = extractBrowserOrigin(req);
+  return normalizeOrigin(req?.authTargetOrigin ||
+    (isIdentityManagementOrigin(browserOrigin) ? req?.body?.targetOrigin || browserOrigin : browserOrigin));
+};
+
+const signToken = (user, sid, req) =>
   signTypedJwt({
     secret: process.env.JWT_SECRET,
     payload: {
       userId: toObjectIdString(user._id),
       tokenVersion: user.refreshTokenVersion,
       sid: sanitizeText(sid, 120) || undefined,
+      targetOrigin: findRefreshSession(user, sid)?.identityManagement
+        ? tokenTargetOrigin(req) : findRefreshSession(user, sid)?.applicationOrigin,
+      identityManagement: Boolean(findRefreshSession(user, sid)?.identityManagement &&
+        isIdentityManagementOrigin(req?.authTargetOrigin || req?.body?.targetOrigin || extractBrowserOrigin(req)) &&
+        (req?.authTargetOrigin || isIdentityManagementOrigin(extractBrowserOrigin(req)))),
     },
     audience: ACCESS_TOKEN_AUDIENCE,
-    expiresIn: ACCESS_TOKEN_TTL,
+    expiresIn: sessionLifetimeSec(user, sid, ACCESS_TOKEN_TTL),
     subject: toObjectIdString(user._id),
     type: 'access_token',
   });
@@ -3892,7 +3931,7 @@ const signRefreshToken = (user, sid, refreshTokenId) =>
       jti: sanitizeText(refreshTokenId, 120) || undefined,
     },
     audience: REFRESH_TOKEN_AUDIENCE,
-    expiresIn: REFRESH_TOKEN_TTL,
+    expiresIn: sessionLifetimeSec(user, sid, REFRESH_TOKEN_TTL),
     subject: toObjectIdString(user._id),
     type: 'refresh_token',
   });
@@ -3972,7 +4011,7 @@ const upsertRefreshSession = (user, req, sid = '', requestedLabel = '', options 
 
   if (existingIndex >= 0) {
     const nextSession = {
-      ...sessions[existingIndex],
+      ...(sessions[existingIndex].toObject ? sessions[existingIndex].toObject() : sessions[existingIndex]),
       sid: sessionId,
       label: label || sessions[existingIndex].label || 'Browser session',
       createdAt: sessions[existingIndex].createdAt || now,
@@ -4007,6 +4046,9 @@ const upsertRefreshSession = (user, req, sid = '', requestedLabel = '', options 
       currentRefreshTokenId,
       previousRefreshTokenId,
       previousRefreshTokenGraceUntil,
+      identityManagement: Boolean(isIdentityManagementOrigin(req.authTargetOrigin || req.body?.targetOrigin || extractBrowserOrigin(req)) &&
+        (req.authTargetOrigin || isIdentityManagementOrigin(extractBrowserOrigin(req)))),
+      applicationOrigin: tokenTargetOrigin(req),
     });
   }
 
@@ -4030,12 +4072,12 @@ const findRefreshSession = (user, sid) => {
 
   const sessions = Array.isArray(user.refreshSessions) ? user.refreshSessions : [];
   return (
-    sessions.find((session) => sanitizeText(session?.sid, 120) === sessionId) || null
+    sessions.find((session) => sanitizeText(session?.sid, 120) === sessionId && isSessionActive(session)) || null
   );
 };
 
-const buildTokenPair = (user, sid, refreshTokenId) => {
-  const accessToken = signToken(user, sid);
+const buildTokenPair = (user, sid, refreshTokenId, req) => {
+  const accessToken = signToken(user, sid, req);
   const refreshToken = signRefreshToken(user, sid, refreshTokenId);
 
   return {
@@ -4057,7 +4099,7 @@ const createTrackedRefreshSession = (user, req, requestedLabel = '', deviceFinge
 
   return {
     sid,
-    ...buildTokenPair(user, sid, refreshTokenId),
+    ...buildTokenPair(user, sid, refreshTokenId, req),
   };
 };
 
@@ -4074,22 +4116,13 @@ const rotateRefreshSessionToken = (user, req, sid, session, requestedLabel = '')
       : null,
   });
 
-  return buildTokenPair(user, sid, nextRefreshTokenId);
-};
-
-const reissueCurrentRefreshSession = (user, req, sid, session, requestedLabel = '') => {
-  const currentRefreshTokenId =
-    sanitizeText(session?.currentRefreshTokenId, 120) || createRefreshTokenId();
-
-  upsertRefreshSession(user, req, sid, requestedLabel, {
-    deviceFingerprint: sanitizeText(session?.deviceFingerprint, 128),
-    currentRefreshTokenId,
-  });
-
-  return buildTokenPair(user, sid, currentRefreshTokenId);
+  return buildTokenPair(user, sid, nextRefreshTokenId, req);
 };
 
 const issueInteractiveSession = async (req, res, user, options = {}) => {
+  if (!user.isVerified || isSuspendedAccount(user.accountStatus)) {
+    throw createHttpError(403, 'This account cannot sign in.');
+  }
   const {
     deviceLabel = '',
     auditType = 'login',
@@ -4147,7 +4180,7 @@ const issueInteractiveSession = async (req, res, user, options = {}) => {
 const completeInteractiveSignIn = async (res, req, user, options = {}) => {
   const { sessionTokens } = await issueInteractiveSession(req, res, user, options);
 
-  res.cookie('refreshToken', sessionTokens.refreshToken, buildCookieOptions(req));
+  res.cookie(REFRESH_COOKIE_NAME, sessionTokens.refreshToken, buildCookieOptions(req));
 
   return sendUserResponse(res, 200, 'Login successful.', user, {
     ...buildAuthSuccessMeta(req, {
@@ -4525,23 +4558,17 @@ const buildBootstrapAppPayload = (authApp) => ({
   dashboardUrl: sanitizeText(authApp?.dashboardUrl, 2000),
 });
 
-const buildBootstrapLinkedAccountsPayload = (user) => {
+const buildBootstrapLinkedAccountsPayload = (user, authApp) => {
   const providerStates = buildOauthProvidersState(user);
   const linkedAccounts = {};
 
   for (const provider of OAUTH_PROVIDERS) {
     const state = providerStates[provider] || {};
-    linkedAccounts[provider] = {
-      linked: Boolean(state.linked),
-      providerUserId: sanitizeText(state.providerUserId, 160),
-      username: sanitizeText(state.username, 120),
-      email: sanitizeText(state.email, 320).toLowerCase(),
-      emailVerified: Boolean(state.emailVerified),
-      profileUrl: sanitizeText(state.profileUrl, 1000),
-      avatarUrl: sanitizeText(state.avatarUrl, 1000),
-      linkedAt: state.linkedAt || null,
-      lastUsedAt: state.lastUsedAt || null,
-    };
+    linkedAccounts[provider] = { linked: Boolean(state.linked) };
+    if (authApp?.requiredLinkedProviders?.includes(provider)) {
+      linkedAccounts[provider].providerUserId = sanitizeText(state.providerUserId, 160);
+      linkedAccounts[provider].username = sanitizeText(state.username, 120);
+    }
   }
 
   return linkedAccounts;
@@ -4625,8 +4652,6 @@ const buildBootstrapCurrentUserPayload = (user) => {
     isVerified: payload.isVerified,
     createdAt: payload.createdAt,
     updatedAt: payload.updatedAt,
-    lastLoginAt: payload.lastLoginAt,
-    lastLoginIp: payload.lastLoginIp,
     accountRole: payload.authority?.role || normalizeAccountRole(user?.accountRole),
     accountStatus: payload.authority?.status || normalizeAccountStatus(user?.accountStatus),
   };
@@ -4687,7 +4712,7 @@ const buildBootstrapAuthenticatedPayload = (
     canRefresh = true,
   } = {}
 ) => {
-  const linkedAccounts = buildBootstrapLinkedAccountsPayload(user);
+  const linkedAccounts = buildBootstrapLinkedAccountsPayload(user, authApp);
   const appAccess = buildBootstrapAppAccess(authApp, user, linkedAccounts);
   const requirements = buildBootstrapRequirements(user, authApp, linkedAccounts, appAccess);
 
@@ -4935,7 +4960,8 @@ const buildPublicSearchQuery = (regex) => {
 };
 
 const sendUserResponse = (res, status, message, user, extra = {}) => {
-  const payload = buildUserPayload(user);
+  const payload = extra.accessToken && jwt.decode(extra.accessToken)?.identityManagement !== true
+    ? buildAppUserPayload(user) : buildUserPayload(user);
 
   return res.status(status).json({
     message,
@@ -4944,6 +4970,12 @@ const sendUserResponse = (res, status, message, user, extra = {}) => {
     user: payload,
   });
 };
+
+const buildAppUserPayload = (user) => ({
+  userId: toObjectIdString(user._id), continentalId: toObjectIdString(user._id),
+  email: user.email, username: getDisplayableUsername(user), displayName: user.displayName,
+  isVerified: user.isVerified, profile: { avatar: sanitizeAvatar(user.profile?.avatar, '') },
+});
 
 const buildAuthSuccessMeta = (req, extra = {}) => ({
   auth: {
@@ -5050,7 +5082,7 @@ const buildActivitySummary = (recentLogins = [], dailyCounts = []) => {
 };
 
 const FULL_USER_SELECT_FIELDS =
-  'email username displayName accountRole accountStatus accountStatusReason isVerified verificationToken verificationTokenExpires emailDelivery passwordResetToken passwordResetTokenExpires passwordResetRequestedAt lastLoginAt lastLoginIp recentLogins loginDayCounts knownDevices auditEvents profile linkedAccounts oauthIdentities integrations preferences security refreshTokenVersion refreshSessions createdAt updatedAt password';
+  '__v email username displayName accountRole accountStatus accountStatusReason isVerified verificationToken verificationTokenExpires emailDelivery passwordResetToken passwordResetTokenExpires passwordResetRequestedAt lastLoginAt lastLoginIp recentLogins loginDayCounts knownDevices auditEvents profile linkedAccounts oauthIdentities integrations preferences security refreshTokenVersion refreshSessions createdAt updatedAt password';
 
 const syncConfiguredOwnerAccess = (user) => {
   if (!user) return false;
@@ -5072,28 +5104,8 @@ const syncConfiguredOwnerAccess = (user) => {
     user.accountStatusReason = normalizedReason;
     changed = true;
   }
-  if (shouldAutoGrantOwnerRole(user.email) && !isOwnerRole(user.accountRole)) {
-    user.accountRole = ACCOUNT_ROLE_OWNER;
-    changed = true;
-  }
 
   return changed;
-};
-
-const maybeAssignBootstrapOwner = async (user) => {
-  if (!user || isOwnerRole(user.accountRole)) return false;
-  if (shouldAutoGrantOwnerRole(user.email)) {
-    user.accountRole = ACCOUNT_ROLE_OWNER;
-    return true;
-  }
-
-  const hasOwner = await User.exists({ accountRole: ACCOUNT_ROLE_OWNER });
-  if (hasOwner) {
-    return false;
-  }
-
-  user.accountRole = ACCOUNT_ROLE_OWNER;
-  return true;
 };
 
 const ensureUserState = async (user, { ensureIdentity = true } = {}) => {
@@ -5142,7 +5154,7 @@ const getOwnerUserById = async (id) => {
 };
 
 const countRemainingOwners = async (excludeUserId) => {
-  const filter = { accountRole: ACCOUNT_ROLE_OWNER };
+  const filter = { accountRole: ACCOUNT_ROLE_OWNER, accountStatus: ACCOUNT_STATUS_ACTIVE };
   if (excludeUserId && mongoose.isValidObjectId(excludeUserId)) {
     filter._id = { $ne: excludeUserId };
   }
@@ -5233,8 +5245,8 @@ const uniqThrottleKeys = (keys = []) =>
   );
 
 const buildLoginThrottleKeys = ({ identifier = '', req, user = null } = {}) => {
-  const normalizedIdentifier = normalizeLoginIdentifier(identifier);
-  const ip = parseClientIp(req);
+  const normalizedIdentifier = hashToken(normalizeLoginIdentifier(identifier));
+  const ip = getClientIpKey(req);
   const userId = toObjectIdString(user?._id);
 
   return uniqThrottleKeys([
@@ -5248,8 +5260,8 @@ const buildLoginThrottleKeys = ({ identifier = '', req, user = null } = {}) => {
 
 const buildPublicActionThrottleKeys = (action, { identifier = '', req, user = null } = {}) => {
   const prefix = sanitizeText(action, 40).toLowerCase();
-  const normalizedIdentifier = normalizeLoginIdentifier(identifier);
-  const ip = parseClientIp(req);
+  const normalizedIdentifier = hashToken(normalizeLoginIdentifier(identifier));
+  const ip = getClientIpKey(req);
   const userId = toObjectIdString(user?._id);
 
   return uniqThrottleKeys([
@@ -5279,7 +5291,7 @@ const findUserByLoginIdentifier = async (identifier) => {
 const buildThrottleExpiry = (windowMs, blockMs, now = Date.now()) =>
   new Date(now + Math.max(windowMs, blockMs) + 60_000);
 
-const getThrottleState = async (key, windowMs) => {
+const getThrottleState = async (key, _windowMs) => {
   const now = Date.now();
   const entry = await LoginThrottle.findOne({ key }).select('windowStartedAt blockedUntil');
 
@@ -5295,67 +5307,29 @@ const getThrottleState = async (key, windowMs) => {
     };
   }
 
-  const windowStartedAt = entry.windowStartedAt ? new Date(entry.windowStartedAt).getTime() : 0;
-  if (!windowStartedAt || now - windowStartedAt > windowMs) {
-    await LoginThrottle.deleteOne({ key });
-  }
-
   return { blocked: false, retryAfterSec: 0 };
 };
 
 const registerThrottleFailure = async (key, { windowMs, maxAttempts, blockMs }) => {
   const now = Date.now();
-  const current = await LoginThrottle.findOne({ key });
-
-  if (
-    !current ||
-    !current.windowStartedAt ||
-    now - new Date(current.windowStartedAt).getTime() > windowMs
-  ) {
-    try {
-      await LoginThrottle.findOneAndUpdate(
-        { key },
-        {
-          key,
-          windowStartedAt: new Date(now),
-          count: 1,
-          blockedUntil: null,
-          expiresAt: buildThrottleExpiry(windowMs, blockMs, now),
-        },
-        {
-          new: true,
-          upsert: true,
-          setDefaultsOnInsert: true,
-        }
-      );
-    } catch (err) {
-      if (!isDuplicateKeyError(err)) {
-        throw err;
-      }
-
-      const retry = await LoginThrottle.findOne({ key });
-      if (!retry) {
-        throw err;
-      }
-
-      retry.count += 1;
-      retry.expiresAt = buildThrottleExpiry(windowMs, blockMs, now);
-      if (retry.count >= maxAttempts) {
-        retry.blockedUntil = new Date(now + blockMs);
-      }
-      await retry.save();
-    }
-    return;
+  const freshWindow = { $gt: [{ $ifNull: ['$windowStartedAt', new Date(0)] }, new Date(now - windowMs)] };
+  const pipeline = [
+    { $set: {
+      count: { $cond: [freshWindow, { $add: [{ $ifNull: ['$count', 0] }, 1] }, 1] },
+      windowStartedAt: { $cond: [freshWindow, '$windowStartedAt', new Date(now)] },
+      expiresAt: buildThrottleExpiry(windowMs, blockMs, now),
+    } },
+    { $set: { blockedUntil: { $cond: [
+      { $gt: ['$blockedUntil', new Date(now)] }, '$blockedUntil',
+      { $cond: [{ $gte: ['$count', maxAttempts] }, new Date(now + blockMs), null] },
+    ] } } },
+  ];
+  try {
+    await LoginThrottle.findOneAndUpdate({ key }, pipeline, { upsert: true, updatePipeline: true });
+  } catch (err) {
+    if (!isDuplicateKeyError(err)) throw err;
+    await LoginThrottle.findOneAndUpdate({ key }, pipeline, { updatePipeline: true });
   }
-
-  current.count += 1;
-  current.expiresAt = buildThrottleExpiry(windowMs, blockMs, now);
-
-  if (current.count >= maxAttempts) {
-    current.blockedUntil = new Date(now + blockMs);
-  }
-
-  await current.save();
 };
 
 const clearThrottleFailures = async (key) => {
@@ -5385,7 +5359,10 @@ const clearThrottleFailuresForKeys = async (keys) => {
   await Promise.all(uniqueKeys.map((key) => clearThrottleFailures(key)));
 };
 
-const getLoginThrottleState = async (keys) => getAggregateThrottleState(keys, LOGIN_RATE_WINDOW_MS);
+const getLoginThrottleState = async (keys) => getAggregateThrottleState(
+  keys.filter((key) => !key.startsWith('login:identifier:') && !key.startsWith('login:user:')),
+  LOGIN_RATE_WINDOW_MS
+);
 
 const registerLoginFailure = async (keys) =>
   registerThrottleFailures(keys, {
@@ -5395,7 +5372,8 @@ const registerLoginFailure = async (keys) =>
   });
 
 const clearLoginFailures = async (keys) => {
-  await clearThrottleFailuresForKeys(keys);
+  // Knowing one valid password must not reset the IP's credential-stuffing budget.
+  await clearThrottleFailuresForKeys(keys.filter((key) => !key.startsWith('login:ip:')));
 };
 
 const consumePublicActionThrottle = async (keys, { windowMs, maxAttempts, blockMs }) =>
@@ -5434,6 +5412,26 @@ const verifyMfaChallenge = async (user, req, { mfaCode = '', backupCode = '' } =
   }
 
   const result = verifyMfaAttempt(user, { mfaCode, backupCode });
+  if (result.ok) {
+    const filter = { _id: user._id, __v: user.__v, 'security.mfa.enabled': true,
+      'security.mfa.secret': user.security.mfa.secret };
+    const update = { $inc: { __v: 1 }, $set: { 'security.mfa.lastUsedAt': new Date() } };
+    if (result.method === 'backup_code') {
+      filter['security.mfa.backupCodes'] = result.storedHash;
+      update.$pull = { 'security.mfa.backupCodes': result.storedHash };
+    } else {
+      filter.$or = [ { 'security.mfa.lastAcceptedStep': { $lt: result.step } },
+        { 'security.mfa.lastAcceptedStep': { $exists: false } } ];
+      update.$set['security.mfa.lastAcceptedStep'] = result.step;
+    }
+    const claimed = await User.updateOne(filter, update);
+    if (!claimed.modifiedCount) result.ok = false;
+    else {
+      user.__v += 1;
+      if (result.method === 'backup_code') user.security.mfa.backupCodes = user.security.mfa.backupCodes.filter((hash) => hash !== result.storedHash);
+      else user.security.mfa.lastAcceptedStep = result.step;
+    }
+  }
   if (!result.ok) {
     await registerMfaFailure(user);
     appendAuditEvent(user, req, 'mfa_failed', 'An invalid MFA code was submitted.', {});
@@ -5453,7 +5451,7 @@ const verifyMfaChallenge = async (user, req, { mfaCode = '', backupCode = '' } =
     appendAuditEvent(user, req, 'mfa_backup_code_used', 'A backup code was used for verification.');
   }
 
-  return { ok: true, ...result };
+  return { ok: true, method: result.method };
 };
 
 const sendProtectedActionMfaError = (res, mfaResult, missingMessage = 'Enter your MFA code to continue.') => {
@@ -5530,7 +5528,7 @@ const revokeRefreshSessionForReplay = async (user, sid) => {
 };
 
 const resolveRefreshSessionFromCookie = async (req, res) => {
-  const token = req.cookies.refreshToken;
+  const token = req.cookies[REFRESH_COOKIE_NAME];
   if (!token) return null;
 
   let payload;
@@ -5540,7 +5538,6 @@ const resolveRefreshSessionFromCookie = async (req, res) => {
       secret: process.env.REFRESH_TOKEN_SECRET,
       audience: REFRESH_TOKEN_AUDIENCE,
       type: 'refresh_token',
-      allowLegacy: true,
     });
   } catch {
     clearRefreshCookie(res, req);
@@ -5548,6 +5545,10 @@ const resolveRefreshSessionFromCookie = async (req, res) => {
   }
 
   const userId = sanitizeText(payload?.userId || payload?.sub, 120);
+  if (!/^[a-f0-9]{24}$/i.test(userId) || !payload.sid || !payload.jti || !Number.isInteger(payload.tokenVersion)) {
+    clearRefreshCookie(res, req);
+    return null;
+  }
   const user = await getUserById(userId);
   if (!user) {
     clearRefreshCookie(res, req);
@@ -5627,7 +5628,6 @@ const resolveAccessTokenBootstrapSession = async (accessToken) => {
       secret: process.env.JWT_SECRET,
       audience: ACCESS_TOKEN_AUDIENCE,
       type: 'access_token',
-      allowLegacy: true,
     });
   } catch {
     const error = createHttpError(401, 'Token invalid or expired.');
@@ -5636,6 +5636,9 @@ const resolveAccessTokenBootstrapSession = async (accessToken) => {
   }
 
   const userId = sanitizeText(payload?.userId || payload?.sub, 120);
+  if (!/^[a-f0-9]{24}$/i.test(userId) || !payload.sid || !Number.isInteger(payload.tokenVersion)) {
+    throw createHttpError(401, 'Invalid token payload.');
+  }
   const user = await getUserById(userId);
   if (!user) {
     const error = createHttpError(401, 'User not found.');
@@ -5667,7 +5670,31 @@ const resolveAccessTokenBootstrapSession = async (accessToken) => {
     sid,
     session: sid ? findRefreshSession(user, sid) : null,
     tokenState: 'access-token',
+    targetOrigin: normalizeOrigin(payload.targetOrigin),
+    identityManagement: payload.identityManagement === true && findRefreshSession(user, sid)?.identityManagement === true,
   };
+};
+
+const renewRefreshSession = async (req, res, resolved) => {
+  let session = resolved;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!session?.user || !session.sid || !session.user.isVerified || isSuspendedAccount(session.user.accountStatus)) {
+      throw createHttpError(401, 'Session is no longer valid.');
+    }
+    if (session.tokenState === 'grace') {
+      // Concurrent requests return the rotation winner. Never rotate the loser.
+      return { user: session.user, ...buildTokenPair(session.user, session.sid, session.session.currentRefreshTokenId, req) };
+    }
+    const tokenPair = rotateRefreshSessionToken(session.user, req, session.sid, session.session);
+    try {
+      await session.user.save();
+      return { user: session.user, ...tokenPair };
+    } catch (err) {
+      if (err.name !== 'VersionError') throw err;
+      session = await resolveRefreshSessionFromCookie(req, res);
+    }
+  }
+  throw createHttpError(409, 'Concurrent session update. Retry shortly.');
 };
 
 exports.register = async (req, res) => {
@@ -5691,7 +5718,7 @@ exports.register = async (req, res) => {
         buildAuthErrorPayload(req, {
           code: AUTH_ERROR_CODE.registrationFailed,
           message:
-            'Password must be at least 8 characters and include uppercase, lowercase, and a number.',
+            'Password must be at least 8 characters, at most 72 UTF-8 bytes, and include uppercase, lowercase, and a number. NUL characters are not supported.',
         })
       );
     }
@@ -5733,20 +5760,10 @@ exports.register = async (req, res) => {
     });
 
     await applyUsernameChange(user, requestedUsername);
-    const grantedBootstrapOwner = await maybeAssignBootstrapOwner(user);
     const verification = prepareEmailVerification(user);
     appendAuditEvent(user, req, 'register', 'Account created. Email verification required before sign-in.', {
       username: getDisplayableUsername(user),
     });
-    if (grantedBootstrapOwner) {
-      appendAuditEvent(
-        user,
-        req,
-        'owner_granted',
-        'Owner access granted during account bootstrap.',
-        { reason: shouldAutoGrantOwnerRole(user.email) ? 'configured_email' : 'first_owner_bootstrap' }
-      );
-    }
     await user.save();
     const verificationDelivery = await sendVerificationEmail(user, req, verification);
 
@@ -5783,7 +5800,7 @@ exports.register = async (req, res) => {
         })
       );
     }
-    console.error('Register error:', err);
+    logError('Register error:', err);
     return res.status(500).json(
       buildAuthErrorPayload(req, {
         code: AUTH_ERROR_CODE.registrationFailed,
@@ -5841,6 +5858,7 @@ exports.login = async (req, res) => {
     }
 
     if (!user) {
+      await comparePassword(password, null);
       await registerLoginFailure(throttleKeys);
       return res.status(400).json(
         buildAuthErrorPayload(req, {
@@ -5942,11 +5960,11 @@ exports.login = async (req, res) => {
     }
 
     await clearLoginFailures(throttleKeys);
-    return completeInteractiveSignIn(res, req, user, {
+    return await completeInteractiveSignIn(res, req, user, {
       deviceLabel: req.body?.deviceLabel,
     });
   } catch (err) {
-    console.error('Login error:', err);
+    logError('Login error:', err);
     return res.status(500).json(
       buildAuthErrorPayload(req, {
         code: AUTH_ERROR_CODE.unavailable,
@@ -5979,9 +5997,8 @@ exports.logout = async (req, res) => {
     clearRefreshCookie(res, req);
     return res.status(200).json({ message: 'Logged out successfully.' });
   } catch (err) {
-    console.error('Logout error:', err);
-    clearRefreshCookie(res, req);
-    return res.status(200).json({ message: 'Logged out.' });
+    logError('Logout error:', err);
+    return res.status(503).json({ message: 'Session revocation unavailable. Retry logout.', retryable: true });
   }
 };
 
@@ -6043,7 +6060,7 @@ exports.requestPasswordReset = async (req, res) => {
 
     return res.status(200).json({ message: genericMessage });
   } catch (err) {
-    console.error('Password reset request error:', err);
+    logError('Password reset request error:', err);
     return res.status(200).json({ message: genericMessage });
   }
 };
@@ -6121,7 +6138,7 @@ exports.publicResendVerificationEmail = async (req, res) => {
 
     return res.status(200).json({ message: genericMessage });
   } catch (err) {
-    console.error('Public resend verification email error:', err);
+    logError('Public resend verification email error:', err);
     return res.status(200).json({ message: genericMessage });
   }
 };
@@ -6137,7 +6154,7 @@ exports.resetPassword = async (req, res) => {
   if (!isStrongPassword(newPassword)) {
     return res.status(400).json({
       message:
-        'New password must be at least 8 characters and include uppercase, lowercase, and a number.',
+        'New password must be at least 8 characters, at most 72 UTF-8 bytes, and include uppercase, lowercase, and a number. NUL characters are not supported.',
     });
   }
 
@@ -6151,12 +6168,28 @@ exports.resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'Invalid or expired password reset link.' });
     }
 
-    clearPasswordReset(user);
-    user.password = newPassword;
-    user.refreshTokenVersion += 1;
-    user.refreshSessions = [];
     appendAuditEvent(user, req, 'password_reset_completed', 'Password reset completed.');
-    await user.save();
+    const password = await hashPassword(newPassword);
+    const result = await User.updateOne({
+      _id: user._id,
+      __v: user.__v,
+      passwordResetToken: hashToken(token),
+      passwordResetTokenExpires: { $gt: new Date() },
+    }, {
+      $set: {
+        password,
+        'security.passwordChangedAt': new Date(),
+        passwordResetToken: '',
+        passwordResetTokenExpires: null,
+        refreshSessions: [],
+      },
+      $inc: { refreshTokenVersion: 1, __v: 1 },
+      $push: { auditEvents: { $each: [user.auditEvents[user.auditEvents.length - 1].toObject()], $slice: -MAX_AUDIT_EVENTS } },
+    });
+    if (!result.modifiedCount) {
+      return res.status(400).json({ message: 'Invalid or expired password reset link.' });
+    }
+    clearRefreshCookie(res, req);
 
     await sendSecurityAlertEmail(
       user,
@@ -6173,7 +6206,7 @@ exports.resetPassword = async (req, res) => {
       message: 'Password reset successful. You can now sign in with your new password.',
     });
   } catch (err) {
-    console.error('Password reset completion error:', err);
+    logError('Password reset completion error:', err);
     return res.status(500).json({ message: 'Failed to reset password.' });
   }
 };
@@ -6225,7 +6258,7 @@ exports.searchPublicProfiles = async (req, res) => {
       results: rankedUsers.map((user) => buildPublicProfilePayload(user)),
     });
   } catch (err) {
-    console.error('Public profile search error:', err);
+    logError('Public profile search error:', err);
     return res.status(500).json({ message: 'Failed to search public profiles.' });
   }
 };
@@ -6254,7 +6287,7 @@ exports.getPublicProfile = async (req, res) => {
       profile: buildPublicProfilePayload(user),
     });
   } catch (err) {
-    console.error('Get public profile error:', err);
+    logError('Get public profile error:', err);
     return res.status(500).json({ message: 'Failed to load public profile.' });
   }
 };
@@ -6271,9 +6304,31 @@ exports.me = async (req, res) => {
       );
     }
 
-    return sendUserResponse(res, 200, 'User loaded.', user, buildAuthSuccessMeta(req));
+    const origin = extractBrowserOrigin(req);
+    // Relying services send their own configured origin, never a caller-controlled origin.
+    if (origin && !req.user.canManageIdentity && origin !== req.user.targetOrigin) {
+      return res.status(403).json(buildAuthErrorPayload(req, {
+        code: 'auth/insufficient-scope', message: 'Token is not authorized for this application.',
+      }));
+    }
+    const authContext = { applicationOrigin: req.user.targetOrigin, identityManagement: req.user.canManageIdentity };
+    if (!req.user.canManageIdentity) {
+      const app = origin ? await AuthApp.findOne({ status: 'active', allowedOrigins: origin }).lean() : null;
+      const payload = buildAppUserPayload(user);
+      // Optional Discord connection is part of Blueprint's account contract. Expose only
+      // the stable identifier and display fields, never provider credentials/history.
+      if (app && ['blueprint', 'vanguard'].includes(app.appId)) {
+        const discord = buildOauthProvidersState(user).discord;
+        payload.oauthProviders = { discord: { linked: discord.linked,
+          providerUserId: discord.providerUserId, username: discord.username, avatarUrl: discord.avatarUrl } };
+      }
+      if (app?.appId === 'status') payload.authority = buildAuthorityPayload(user);
+      return res.json({ ...buildAuthSuccessMeta(req), authContext, message: 'User loaded.', authenticated: true,
+        user: payload });
+    }
+    return sendUserResponse(res, 200, 'User loaded.', user, { ...buildAuthSuccessMeta(req), authContext });
   } catch (err) {
-    console.error('Fetch me error:', err);
+    logError('Fetch me error:', err);
     return res.status(500).json(
       buildAuthErrorPayload(req, {
         code: AUTH_ERROR_CODE.unavailable,
@@ -6297,7 +6352,7 @@ exports.getOwnerSummary = async (req, res) => {
       summary: buildOwnerSummary(users),
     });
   } catch (err) {
-    console.error('Owner summary error:', err);
+    logError('Owner summary error:', err);
     return res.status(500).json({ message: 'Failed to load owner summary.' });
   }
 };
@@ -6331,7 +6386,7 @@ exports.listOwnerUsers = async (req, res) => {
       users: hydratedUsers.map((user) => buildOwnerUserSummary(user)),
     });
   } catch (err) {
-    console.error('Owner user list error:', err);
+    logError('Owner user list error:', err);
     return res.status(500).json({ message: 'Failed to load users.' });
   }
 };
@@ -6351,7 +6406,7 @@ exports.getOwnerUser = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner user lookup error:', err);
+    logError('Owner user lookup error:', err);
     return res.status(500).json({ message: 'Failed to load user.' });
   }
 };
@@ -6492,7 +6547,7 @@ exports.updateOwnerUser = async (req, res) => {
     if (isDuplicateKeyError(err)) {
       return res.status(409).json({ message: getDuplicateUserFieldMessage(err) });
     }
-    console.error('Owner user update error:', err);
+    logError('Owner user update error:', err);
     return res.status(500).json({ message: 'Failed to update user.' });
   }
 };
@@ -6526,7 +6581,7 @@ exports.revokeOwnerUserSessions = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner revoke sessions error:', err);
+    logError('Owner revoke sessions error:', err);
     return res.status(500).json({ message: 'Failed to revoke sessions.' });
   }
 };
@@ -6561,7 +6616,7 @@ exports.resetOwnerUserMfa = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner reset MFA error:', err);
+    logError('Owner reset MFA error:', err);
     return res.status(500).json({ message: 'Failed to reset MFA.' });
   }
 };
@@ -6606,7 +6661,7 @@ exports.resendOwnerUserVerification = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner resend verification error:', err);
+    logError('Owner resend verification error:', err);
     return res.status(500).json({ message: 'Failed to resend verification email.' });
   }
 };
@@ -6644,7 +6699,7 @@ exports.sendOwnerUserPasswordReset = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner password reset email error:', err);
+    logError('Owner password reset email error:', err);
     return res.status(500).json({ message: 'Failed to send password reset email.' });
   }
 };
@@ -6655,6 +6710,8 @@ exports.deleteOwnerUser = async (req, res) => {
     const targetUser = await getOwnerUserById(req.params.userId);
 
     await assertOwnerRetention(targetUser, { deleting: true });
+
+    const deletion = await deleteAccountRecord(targetUser);
 
     await sendSecurityAlertEmail(
       targetUser,
@@ -6671,10 +6728,9 @@ exports.deleteOwnerUser = async (req, res) => {
       await actor.save();
     }
 
-    await User.deleteOne({ _id: targetUser._id });
-
     return res.json({
-      message: 'Account deleted permanently.',
+      message: deletion.cleanupPending ? 'Account deleted. Dependent data cleanup is pending.' : 'Account deleted permanently.',
+      cleanupPending: deletion.cleanupPending,
       deletedUserId: toObjectIdString(targetUser._id),
       deletedOwnAccount: toObjectIdString(actor?._id) === toObjectIdString(targetUser._id),
     });
@@ -6682,7 +6738,7 @@ exports.deleteOwnerUser = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Owner delete user error:', err);
+    logError('Owner delete user error:', err);
     return res.status(500).json({ message: 'Failed to delete account.' });
   }
 };
@@ -6721,18 +6777,9 @@ exports.refreshToken = async (req, res) => {
       );
     }
 
-    let tokenPair;
-    if (session.tokenState === 'grace') {
-      tokenPair = reissueCurrentRefreshSession(session.user, req, session.sid, session.session);
-    } else if (session.sid) {
-      tokenPair = rotateRefreshSessionToken(session.user, req, session.sid, session.session);
-    } else {
-      tokenPair = createTrackedRefreshSession(session.user, req);
-    }
+    const tokenPair = await renewRefreshSession(req, res, session);
 
-    await session.user.save();
-
-    res.cookie('refreshToken', tokenPair.refreshToken, buildCookieOptions(req));
+    res.cookie(REFRESH_COOKIE_NAME, tokenPair.refreshToken, buildCookieOptions(req));
 
     return res.json({
       ...buildAuthSuccessMeta(req, {
@@ -6746,12 +6793,12 @@ exports.refreshToken = async (req, res) => {
       continentalId: toObjectIdString(session.user._id),
     });
   } catch (err) {
-    console.error('Refresh token error:', err);
-    clearRefreshCookie(res, req);
-    return res.status(200).json(
+    logError('Refresh token error:', err);
+    return res.status(err.statusCode || 503).json(
       buildAuthErrorPayload(req, {
-        code: AUTH_ERROR_CODE.invalidRefreshSession,
-        message: 'Invalid refresh session.',
+        code: AUTH_ERROR_CODE.unavailable,
+        message: 'Refresh unavailable. Retry shortly.',
+        retryable: true,
       })
     );
   }
@@ -6763,6 +6810,9 @@ exports.bootstrap = async (req, res) => {
 
   try {
     const authApp = await requireRegisteredAuthApp(appId);
+    if (!isAllowedAuthAppOrigin(authApp, extractBrowserOrigin(req)) && !isIdentityManagementOrigin(extractBrowserOrigin(req))) {
+      throw createHttpError(403, 'Origin is not registered for this app.');
+    }
 
     let resolvedSession = null;
     if (inlineAccessToken) {
@@ -6798,6 +6848,12 @@ exports.bootstrap = async (req, res) => {
       );
     }
 
+    const canExchangeAcrossApps = inlineAccessToken ? resolvedSession.identityManagement : resolvedSession.session?.identityManagement;
+    const boundOrigin = inlineAccessToken ? resolvedSession.targetOrigin : resolvedSession.session?.applicationOrigin;
+    if (!canExchangeAcrossApps && !isAllowedAuthAppOrigin(authApp, boundOrigin)) {
+      throw createHttpError(403, 'This session is not authorized for that application.');
+    }
+
     if (isSuspendedAccount(resolvedSession.user.accountStatus)) {
       if (!inlineAccessToken) {
         clearRefreshCookie(res, req);
@@ -6811,37 +6867,21 @@ exports.bootstrap = async (req, res) => {
       );
     }
 
+    req.authTargetOrigin = getDefaultAuthAppOrigin(authApp);
     let accessToken = inlineAccessToken;
     let sid = sanitizeText(resolvedSession.sid, 120);
-    let canRefresh = Boolean(req.cookies?.refreshToken);
+    let canRefresh = Boolean(req.cookies?.[REFRESH_COOKIE_NAME]);
 
     if (!accessToken) {
-      let tokenPair;
-      if (resolvedSession.tokenState === 'grace') {
-        tokenPair = reissueCurrentRefreshSession(
-          resolvedSession.user,
-          req,
-          resolvedSession.sid,
-          resolvedSession.session
-        );
-      } else if (resolvedSession.sid) {
-        tokenPair = rotateRefreshSessionToken(
-          resolvedSession.user,
-          req,
-          resolvedSession.sid,
-          resolvedSession.session
-        );
-      } else {
-        tokenPair = createTrackedRefreshSession(resolvedSession.user, req);
-        sid = sanitizeText(tokenPair.sid, 120);
-      }
-
-      await resolvedSession.user.save();
-      res.cookie('refreshToken', tokenPair.refreshToken, buildCookieOptions(req));
+      const tokenPair = await renewRefreshSession(req, res, resolvedSession);
+      resolvedSession.user = tokenPair.user;
+      res.cookie(REFRESH_COOKIE_NAME, tokenPair.refreshToken, buildCookieOptions(req));
       accessToken = tokenPair.accessToken;
       sid = sid || sanitizeText(resolvedSession.sid, 120);
       canRefresh = true;
     }
+    // An app handoff always receives a token without account-management rights.
+    accessToken = signToken(resolvedSession.user, sid, req);
 
     return res.status(200).json(
       buildBootstrapAuthenticatedPayload(req, authApp, resolvedSession.user, {
@@ -6861,7 +6901,7 @@ exports.bootstrap = async (req, res) => {
       );
     }
 
-    console.error('Bootstrap error:', err);
+    logError('Bootstrap error:', err);
     return res.status(500).json(
       buildAuthErrorPayload(req, {
         code: AUTH_ERROR_CODE.unavailable,
@@ -6977,7 +7017,7 @@ exports.updateProfile = async (req, res) => {
     if (isDuplicateKeyError(err)) {
       return res.status(409).json({ message: getDuplicateUserFieldMessage(err) });
     }
-    console.error('Update profile error:', err);
+    logError('Update profile error:', err);
     return res.status(500).json({ message: 'Failed to update profile.' });
   }
 };
@@ -7061,7 +7101,7 @@ exports.updateEmail = async (req, res) => {
     if (isDuplicateKeyError(err)) {
       return res.status(409).json({ message: getDuplicateUserFieldMessage(err) });
     }
-    console.error('Update email error:', err);
+    logError('Update email error:', err);
     return res.status(500).json({ message: 'Failed to update email.' });
   }
 };
@@ -7096,7 +7136,7 @@ exports.resendVerificationEmail = async (req, res) => {
       verificationEmail: serializeVerificationDelivery(verificationDelivery),
     });
   } catch (err) {
-    console.error('Resend verification email error:', err);
+    logError('Resend verification email error:', err);
     return res.status(500).json({ message: 'Failed to resend verification email.' });
   }
 };
@@ -7113,7 +7153,7 @@ exports.getPreferences = async (req, res) => {
       preferences: buildUserPayload(user).preferences,
     });
   } catch (err) {
-    console.error('Get preferences error:', err);
+    logError('Get preferences error:', err);
     return res.status(500).json({ message: 'Failed to load preferences.' });
   }
 };
@@ -7131,7 +7171,7 @@ exports.updatePreferences = async (req, res) => {
 
     return sendUserResponse(res, 200, 'Preferences updated.', user);
   } catch (err) {
-    console.error('Update preferences error:', err);
+    logError('Update preferences error:', err);
     return res.status(500).json({ message: 'Failed to update preferences.' });
   }
 };
@@ -7165,7 +7205,9 @@ exports.startOauthLogin = async (req, res) => {
       targetOrigin,
       fallbackOrigin: targetOrigin,
     });
+    const transaction = await newTransaction(config.provider, req, res);
     const state = buildOauthStateToken({
+      jti: transaction.id,
       appId: authApp?.appId || requestedAppId || '',
       flow: 'login',
       provider: config.provider,
@@ -7173,7 +7215,7 @@ exports.startOauthLogin = async (req, res) => {
       redirectUrl,
       returnTo,
     });
-    return res.redirect(buildOauthAuthorizeUrl(config, state));
+    return res.redirect(buildOauthAuthorizeUrl(config, state, transaction));
   } catch (err) {
     if (err?.statusCode) {
       return res.status(err.statusCode).send(
@@ -7186,7 +7228,7 @@ exports.startOauthLogin = async (req, res) => {
         })
       );
     }
-    console.error('Start OAuth login error:', err);
+    logError('Start OAuth login error:', err);
     return res.status(500).send(
       renderOauthResultPage({
         title: `${providerLabel} sign-in unavailable`,
@@ -7211,6 +7253,17 @@ exports.startOauthLink = async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
     }
+    if (!(await user.comparePassword(req.body?.currentPassword))) {
+      return res.status(403).json({ message: 'Current password is required to link an identity.' });
+    }
+    const reauth = await verifyMfaChallenge(user, req, {
+      mfaCode: sanitizeMfaCode(req.body?.mfaCode), backupCode: sanitizeBackupCode(req.body?.backupCode),
+    });
+    if (!reauth.ok) {
+      await user.save();
+      return sendProtectedActionMfaError(res, reauth);
+    }
+    if (user.isModified()) await user.save();
 
     const config = getOauthProviderConfig(req.params.provider, req);
     const browserOrigin = extractBrowserOrigin(req);
@@ -7234,11 +7287,15 @@ exports.startOauthLink = async (req, res) => {
       targetOrigin,
       fallbackOrigin: targetOrigin,
     });
+    const transaction = await newTransaction(config.provider, req, res);
     const state = buildOauthStateToken({
+      jti: transaction.id,
       appId: authApp?.appId || requestedAppId || '',
       flow: 'link',
       provider: config.provider,
       userId: req.user.id,
+      sid: req.user.sid,
+      tokenVersion: req.user.tokenVersion,
       targetOrigin,
       redirectUrl,
       returnTo,
@@ -7246,14 +7303,14 @@ exports.startOauthLink = async (req, res) => {
 
     return res.json({
       message: `${providerLabel} linking ready.`,
-      url: buildOauthAuthorizeUrl(config, state),
+      url: buildOauthAuthorizeUrl(config, state, transaction),
       provider: config.provider,
     });
   } catch (err) {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Start OAuth link error:', err);
+    logError('Start OAuth link error:', err);
     return res.status(500).json({ message: 'Failed to start identity linking.' });
   }
 };
@@ -7273,9 +7330,10 @@ exports.finishOauthCallback = async (req, res) => {
       throw createHttpError(400, 'OAuth callback provider mismatch.');
     }
 
+    const transaction = await consumeTransaction(config.provider, statePayload, req, res);
     const providerLabel = getOauthProviderLabel(config.provider);
-    const tokenPayload = await requestOauthAccessToken(config, code);
-    const identityProfile = await requestOauthIdentityProfile(config, tokenPayload);
+    const tokenPayload = await requestOauthAccessToken(config, code, transaction.verifier);
+    const identityProfile = await requestOauthIdentityProfile(config, tokenPayload, transaction.nonce);
     const { authApp, targetOrigin } = await resolveAuthAppOriginContext({
       appId: statePayload.appId,
       origin: statePayload.targetOrigin || '',
@@ -7298,6 +7356,10 @@ exports.finishOauthCallback = async (req, res) => {
       const targetUser = await getUserById(statePayload.userId);
       if (!targetUser) {
         throw createHttpError(404, 'The account for this link request could not be found.');
+      }
+      if (!targetUser.isVerified || isSuspendedAccount(targetUser.accountStatus) ||
+          targetUser.refreshTokenVersion !== statePayload.tokenVersion || !findRefreshSession(targetUser, statePayload.sid)) {
+        throw createHttpError(403, 'The session authorizing identity linking was revoked.');
       }
 
       const existingUser = await findUserByOauthIdentity(
@@ -7443,6 +7505,7 @@ exports.finishOauthCallback = async (req, res) => {
       });
     }
 
+    req.authTargetOrigin = targetOrigin;
     const { sessionTokens } = await issueInteractiveSession(req, res, user, {
       auditType: 'oauth_login',
       auditMessage: `Signed in with ${providerLabel}.`,
@@ -7451,7 +7514,7 @@ exports.finishOauthCallback = async (req, res) => {
       },
     });
 
-    res.cookie('refreshToken', sessionTokens.refreshToken, buildCookieOptions(req));
+    res.cookie(REFRESH_COOKIE_NAME, sessionTokens.refreshToken, buildCookieOptions(req));
 
     return res.send(
       renderOauthResultPage({
@@ -7465,7 +7528,8 @@ exports.finishOauthCallback = async (req, res) => {
           event: 'login_success',
           message: 'Returning to your Continental ID session.',
           provider: config.provider,
-          user: buildUserPayload(user),
+          user: sessionTokens.accessToken && jwt.decode(sessionTokens.accessToken)?.identityManagement === true
+            ? buildUserPayload(user) : buildAppUserPayload(user),
         }),
       })
     );
@@ -7476,12 +7540,16 @@ exports.finishOauthCallback = async (req, res) => {
       targetOrigin || DEFAULT_DASHBOARD_ORIGIN
     );
     const providerLabel = getOauthProviderLabel(statePayload?.provider || req.params.provider);
-    const statusCode = err?.statusCode || 500;
-    const message =
-      err?.message || `Could not complete ${providerLabel} sign-in right now. Please try again later.`;
+    const duplicateIdentity = err?.code === 11000;
+    const statusCode = duplicateIdentity ? 409 : err?.statusCode || 500;
+    const message = duplicateIdentity
+      ? 'That external identity is already linked to another account.'
+      : statusCode >= 500
+        ? `Could not complete ${providerLabel} sign-in right now. Please try again later.`
+        : err?.message || 'Authentication failed.';
 
     if (statusCode >= 500) {
-      console.error('Finish OAuth callback error:', err);
+      logError('Finish OAuth callback error:', err);
     }
 
     return res.status(statusCode).send(
@@ -7498,7 +7566,7 @@ exports.finishOauthCallback = async (req, res) => {
           code:
             statusCode >= 500
               ? AUTH_ERROR_CODE.unavailable
-              : err?.statusCode === 409
+              : statusCode === 409
                 ? AUTH_ERROR_CODE.identityConflict
                 : AUTH_ERROR_CODE.authorizationDenied,
           event: 'login_error',
@@ -7523,7 +7591,7 @@ exports.getLinkedAccounts = async (req, res) => {
       oauthProviders: buildUserPayload(user).oauthProviders,
     });
   } catch (err) {
-    console.error('Get linked accounts error:', err);
+    logError('Get linked accounts error:', err);
     return res.status(500).json({ message: 'Failed to load linked accounts.' });
   }
 };
@@ -7539,6 +7607,16 @@ exports.unlinkOauthProvider = async (req, res) => {
     const user = await getUserById(req.user.id);
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
+    }
+    if (!(await user.comparePassword(req.body?.currentPassword))) {
+      return res.status(403).json({ message: 'Current password is required to unlink an identity.' });
+    }
+    const reauth = await verifyMfaChallenge(user, req, {
+      mfaCode: sanitizeMfaCode(req.body?.mfaCode), backupCode: sanitizeBackupCode(req.body?.backupCode),
+    });
+    if (!reauth.ok) {
+      await user.save();
+      return sendProtectedActionMfaError(res, reauth);
     }
 
     const removed = removeOauthIdentity(user, provider);
@@ -7562,16 +7640,12 @@ exports.unlinkOauthProvider = async (req, res) => {
       provider,
       }
     );
+    revokeAllTrackedSessions(user);
     await user.save();
-
-    return sendUserResponse(
-      res,
-      200,
-      `${getOauthProviderLabel(provider)} account unlinked.`,
-      user
-    );
+    clearRefreshCookie(res, req);
+    return sendUserResponse(res, 200, `${getOauthProviderLabel(provider)} account unlinked. Please sign in again.`, user, { forceRelogin: true });
   } catch (err) {
-    console.error('Unlink OAuth provider error:', err);
+    logError('Unlink OAuth provider error:', err);
     return res.status(500).json({ message: 'Failed to unlink the identity provider.' });
   }
 };
@@ -7589,7 +7663,7 @@ exports.updateLinkedAccounts = async (req, res) => {
 
     return sendUserResponse(res, 200, 'Linked accounts updated.', user);
   } catch (err) {
-    console.error('Update linked accounts error:', err);
+    logError('Update linked accounts error:', err);
     return res.status(500).json({ message: 'Failed to update linked accounts.' });
   }
 };
@@ -7612,7 +7686,7 @@ exports.getActivity = async (req, res) => {
       summary: payload.activitySummary,
     });
   } catch (err) {
-    console.error('Get activity error:', err);
+    logError('Get activity error:', err);
     return res.status(500).json({ message: 'Failed to load activity.' });
   }
 };
@@ -7661,12 +7735,14 @@ exports.beginPasskeyRegistration = async (req, res) => {
       },
     });
 
-    storeWebAuthnChallenge(res, req, {
+    await storeWebAuthnChallenge(res, req, {
       flow: 'registration',
       challenge: options.challenge,
       origin,
       rpID,
       userId: toObjectIdString(user._id),
+      sid: req.user.sid,
+      tokenVersion: req.user.tokenVersion,
     });
 
     return res.json({
@@ -7677,7 +7753,7 @@ exports.beginPasskeyRegistration = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Begin passkey registration error:', err);
+    logError('Begin passkey registration error:', err);
     return res.status(500).json({ message: 'Failed to start passkey registration.' });
   }
 };
@@ -7690,7 +7766,7 @@ exports.finishPasskeyRegistration = async (req, res) => {
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    const challenge = readWebAuthnChallenge(req, 'registration');
+    const challenge = await readWebAuthnChallenge(req, 'registration');
     if (sanitizeText(challenge.userId, 120) !== toObjectIdString(user._id)) {
       clearWebAuthnChallengeCookie(res, req);
       return res.status(400).json({ message: 'This passkey setup request does not match your account.' });
@@ -7767,7 +7843,7 @@ exports.finishPasskeyRegistration = async (req, res) => {
     if (isDuplicateKeyError(err)) {
       return res.status(409).json({ message: 'That passkey is already linked to another account.' });
     }
-    console.error('Finish passkey registration error:', err);
+    logError('Finish passkey registration error:', err);
     return res.status(500).json({ message: 'Failed to save the new passkey.' });
   }
 };
@@ -7780,7 +7856,7 @@ exports.beginPasskeyAuthentication = async (req, res) => {
       userVerification: 'required',
     });
 
-    storeWebAuthnChallenge(res, req, {
+    await storeWebAuthnChallenge(res, req, {
       flow: 'authentication',
       challenge: options.challenge,
       origin,
@@ -7795,14 +7871,14 @@ exports.beginPasskeyAuthentication = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Begin passkey authentication error:', err);
+    logError('Begin passkey authentication error:', err);
     return res.status(500).json({ message: 'Failed to start passkey sign-in.' });
   }
 };
 
 exports.finishPasskeyAuthentication = async (req, res) => {
   try {
-    const challenge = readWebAuthnChallenge(req, 'authentication');
+    const challenge = await readWebAuthnChallenge(req, 'authentication');
     const credentialResponse = req.body?.credential || req.body || {};
     const credentialId = sanitizeText(credentialResponse.id, 512);
     if (!credentialId) {
@@ -7864,7 +7940,7 @@ exports.finishPasskeyAuthentication = async (req, res) => {
     passkey.lastUsedAt = new Date();
     clearWebAuthnChallengeCookie(res, req);
 
-    return completeInteractiveSignIn(res, req, user, {
+    return await completeInteractiveSignIn(res, req, user, {
       auditType: 'passkey_login',
       auditMessage: 'Signed in with a passkey.',
       auditMeta: {
@@ -7886,7 +7962,7 @@ exports.finishPasskeyAuthentication = async (req, res) => {
     if (err?.statusCode) {
       return res.status(err.statusCode).json({ message: err.message });
     }
-    console.error('Finish passkey authentication error:', err);
+    logError('Finish passkey authentication error:', err);
     return res.status(500).json({ message: 'Failed to complete passkey sign-in.' });
   }
 };
@@ -7933,11 +8009,12 @@ exports.deletePasskey = async (req, res) => {
     appendAuditEvent(user, req, 'passkey_removed', 'Passkey removed.', {
       credentialId,
     });
+    revokeAllTrackedSessions(user);
     await user.save();
-
-    return sendUserResponse(res, 200, 'Passkey removed.', user);
+    clearRefreshCookie(res, req);
+    return sendUserResponse(res, 200, 'Passkey removed. Please sign in again.', user, { forceRelogin: true });
   } catch (err) {
-    console.error('Delete passkey error:', err);
+    logError('Delete passkey error:', err);
     return res.status(500).json({ message: 'Failed to remove the passkey.' });
   }
 };
@@ -7960,7 +8037,7 @@ exports.getSecurity = async (req, res) => {
       passkeyLimit: MAX_PASSKEYS,
     });
   } catch (err) {
-    console.error('Get security error:', err);
+    logError('Get security error:', err);
     return res.status(500).json({ message: 'Failed to load security settings.' });
   }
 };
@@ -7981,7 +8058,7 @@ exports.updateSecurity = async (req, res) => {
 
     return sendUserResponse(res, 200, 'Security settings updated.', user);
   } catch (err) {
-    console.error('Update security error:', err);
+    logError('Update security error:', err);
     return res.status(500).json({ message: 'Failed to update security settings.' });
   }
 };
@@ -8018,7 +8095,7 @@ exports.beginMfaSetup = async (req, res) => {
       mfa: getMfaState(user),
     });
   } catch (err) {
-    console.error('Begin MFA setup error:', err);
+    logError('Begin MFA setup error:', err);
     return res.status(500).json({ message: 'Failed to start MFA setup.' });
   }
 };
@@ -8043,7 +8120,8 @@ exports.enableMfa = async (req, res) => {
       return res.status(400).json({ message: 'Current password is incorrect.' });
     }
 
-    if (!verifyTotp({ secret: pendingSecret, token: code })) {
+    const step = getTotpStep({ secret: pendingSecret, token: code });
+    if (step === null) {
       return res.status(400).json({ message: 'Invalid MFA code.' });
     }
 
@@ -8057,13 +8135,14 @@ exports.enableMfa = async (req, res) => {
     user.security.mfa.pendingCreatedAt = null;
     user.security.mfa.enrolledAt = new Date();
     user.security.mfa.lastUsedAt = new Date();
+    user.security.mfa.lastAcceptedStep = step;
 
     appendAuditEvent(user, req, 'mfa_enabled', 'Multi-factor authentication enabled.');
     await user.save();
 
     return sendUserResponse(res, 200, 'Multi-factor authentication enabled.', user);
   } catch (err) {
-    console.error('Enable MFA error:', err);
+    logError('Enable MFA error:', err);
     return res.status(500).json({ message: 'Failed to enable MFA.' });
   }
 };
@@ -8111,7 +8190,7 @@ exports.disableMfa = async (req, res) => {
 
     return sendUserResponse(res, 200, 'Multi-factor authentication disabled.', user);
   } catch (err) {
-    console.error('Disable MFA error:', err);
+    logError('Disable MFA error:', err);
     return res.status(500).json({ message: 'Failed to disable MFA.' });
   }
 };
@@ -8163,7 +8242,7 @@ exports.regenerateMfaBackupCodes = async (req, res) => {
       mfa: getMfaState(user),
     });
   } catch (err) {
-    console.error('Regenerate MFA backup codes error:', err);
+    logError('Regenerate MFA backup codes error:', err);
     return res.status(500).json({ message: 'Failed to regenerate backup codes.' });
   }
 };
@@ -8191,7 +8270,7 @@ exports.getDevices = async (req, res) => {
       devices,
     });
   } catch (err) {
-    console.error('Get devices error:', err);
+    logError('Get devices error:', err);
     return res.status(500).json({ message: 'Failed to load devices.' });
   }
 };
@@ -8243,7 +8322,7 @@ exports.updateDevice = async (req, res) => {
       ),
     });
   } catch (err) {
-    console.error('Update device error:', err);
+    logError('Update device error:', err);
     return res.status(500).json({ message: 'Failed to update device.' });
   }
 };
@@ -8295,7 +8374,7 @@ exports.deleteDevice = async (req, res) => {
       forceRelogin,
     });
   } catch (err) {
-    console.error('Delete device error:', err);
+    logError('Delete device error:', err);
     return res.status(500).json({ message: 'Failed to remove device.' });
   }
 };
@@ -8331,7 +8410,7 @@ exports.getSessions = async (req, res) => {
       sessionLimit: MAX_ACTIVE_SESSIONS,
     });
   } catch (err) {
-    console.error('Get sessions error:', err);
+    logError('Get sessions error:', err);
     return res.status(500).json({ message: 'Failed to load sessions.' });
   }
 };
@@ -8377,7 +8456,7 @@ exports.revokeSession = async (req, res) => {
       forceRelogin: revokedCurrentSession,
     });
   } catch (err) {
-    console.error('Revoke session error:', err);
+    logError('Revoke session error:', err);
     return res.status(500).json({ message: 'Failed to revoke session.' });
   }
 };
@@ -8415,7 +8494,7 @@ exports.revokeAllSessions = async (req, res) => {
       forceRelogin: !exceptCurrent || !currentSid,
     });
   } catch (err) {
-    console.error('Revoke all sessions error:', err);
+    logError('Revoke all sessions error:', err);
     return res.status(500).json({ message: 'Failed to revoke sessions.' });
   }
 };
@@ -8429,7 +8508,7 @@ exports.updatePassword = async (req, res) => {
   if (!isStrongPassword(newPassword)) {
     return res.status(400).json({
       message:
-        'New password must be at least 8 characters and include uppercase, lowercase, and a number.',
+        'New password must be at least 8 characters, at most 72 UTF-8 bytes, and include uppercase, lowercase, and a number. NUL characters are not supported.',
     });
   }
 
@@ -8442,8 +8521,6 @@ exports.updatePassword = async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
     }
-
-    await assertOwnerRetention(user, { deleting: true });
 
     const matches = await user.comparePassword(currentPassword);
     if (!matches) {
@@ -8485,7 +8562,7 @@ exports.updatePassword = async (req, res) => {
       forceRelogin: true,
     });
   } catch (err) {
-    console.error('Update password error:', err);
+    logError('Update password error:', err);
     return res.status(500).json({ message: 'Failed to update password.' });
   }
 };
@@ -8525,7 +8602,7 @@ exports.exportAccountData = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Export account error:', err);
+    logError('Export account error:', err);
     return res.status(500).json({ message: 'Failed to export account data.' });
   }
 };
@@ -8546,6 +8623,8 @@ exports.deleteAccount = async (req, res) => {
       return res.status(404).json({ message: 'User not found.' });
     }
 
+    await assertOwnerRetention(user, { deleting: true });
+
     const matches = await user.comparePassword(currentPassword);
     if (!matches) {
       return res.status(400).json({ message: 'Current password is incorrect.' });
@@ -8561,6 +8640,7 @@ exports.deleteAccount = async (req, res) => {
       );
     }
 
+    const deletion = await deleteAccountRecord(user);
     await sendSecurityAlertEmail(
       user,
       'Your Continental ID account was deleted',
@@ -8569,12 +8649,13 @@ exports.deleteAccount = async (req, res) => {
       [`Time: ${new Date().toUTCString()}`]
     );
 
-    await User.deleteOne({ _id: req.user.id });
     clearRefreshCookie(res, req);
 
-    return res.json({ message: 'Account deleted permanently.' });
+    return res.json({ message: deletion.cleanupPending ? 'Account deleted. Dependent data cleanup is pending.' : 'Account deleted permanently.',
+      cleanupPending: deletion.cleanupPending });
   } catch (err) {
-    console.error('Delete account error:', err);
+    if (err.statusCode) return res.status(err.statusCode).json({ message: err.message });
+    logError('Delete account error:', err);
     return res.status(500).json({ message: 'Failed to delete account.' });
   }
 };

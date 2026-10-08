@@ -1,4 +1,5 @@
 const GrimoireDeck = require('../models/GrimoireDeck');
+const { logError } = require('../utils/safeLog');
 
 const DECK_FORMATS = new Set([
   'standard',
@@ -291,7 +292,7 @@ exports.listDecks = async (req, res) => {
       continentalId: toObjectIdString(req.user.id),
     });
   } catch (err) {
-    console.error('List Grimoire decks error:', err);
+    logError('List Grimoire decks error:', err);
     return res.status(500).json({ message: 'Failed to load Grimoire decks.' });
   }
 };
@@ -356,7 +357,7 @@ exports.saveDeck = async (req, res) => {
       return res.status(400).json({ message: err.message });
     }
 
-    console.error('Save Grimoire deck error:', err);
+    logError('Save Grimoire deck error:', err);
     return res.status(500).json({ message: 'Failed to save the Grimoire deck.' });
   }
 };
@@ -449,7 +450,7 @@ exports.importDecks = async (req, res) => {
       return res.status(400).json({ message: err.message });
     }
 
-    console.error('Import Grimoire decks error:', err);
+    logError('Import Grimoire decks error:', err);
     return res.status(500).json({ message: 'Failed to import Grimoire decks.' });
   }
 };
@@ -473,7 +474,7 @@ exports.deleteDeck = async (req, res) => {
       continentalId: toObjectIdString(req.user.id),
     });
   } catch (err) {
-    console.error('Delete Grimoire deck error:', err);
+    logError('Delete Grimoire deck error:', err);
     return res.status(500).json({ message: 'Failed to delete the Grimoire deck.' });
   }
 };

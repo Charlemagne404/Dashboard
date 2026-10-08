@@ -44,43 +44,22 @@ const verifyTypedJwt = ({
   secret,
   audience,
   type,
-  allowLegacy = false,
 } = {}) => {
-  let strictError = null;
-
-  try {
-    const payload = jwt.verify(token, secret, {
-      algorithms: ['HS256'],
-      audience,
-      issuer: TOKEN_ISSUER,
-    });
-
-    if (type && payload?.type !== type) {
-      throw new Error('Unexpected token type.');
-    }
-
-    return payload;
-  } catch (err) {
-    strictError = err;
-  }
-
-  if (!allowLegacy) {
-    throw strictError;
-  }
-
-  const legacyPayload = jwt.verify(token, secret, {
+  const payload = jwt.verify(token, secret, {
     algorithms: ['HS256'],
+    audience,
+    issuer: TOKEN_ISSUER,
   });
 
-  if (legacyPayload?.aud || legacyPayload?.iss || legacyPayload?.type) {
-    throw strictError;
+  if (type && payload?.type !== type) {
+    throw new Error('Unexpected token type.');
   }
 
-  if (type && legacyPayload?.type && legacyPayload.type !== type) {
-    throw strictError;
+  if (!Number.isInteger(payload?.exp) || !Number.isInteger(payload?.iat)) {
+    throw new Error('Token lifetime required.');
   }
 
-  return legacyPayload;
+  return payload;
 };
 
 module.exports = {

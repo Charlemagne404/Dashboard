@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { logError } = require('../utils/safeLog');
 const User = require('../models/User');
 const {
   DISCORD_PROVIDER,
@@ -12,7 +13,7 @@ const {
 
 const MAX_AUDIT_EVENTS = 120;
 const VANGUARD_USER_SELECT =
-  '_id email username displayName isVerified oauthIdentities integrations auditEvents createdAt updatedAt';
+  '_id __v email username displayName isVerified oauthIdentities integrations auditEvents createdAt updatedAt';
 
 const appendVanguardAuditEvent = (user, req, type, message, meta = {}) => {
   const events = Array.isArray(user.auditEvents) ? user.auditEvents : [];
@@ -147,7 +148,7 @@ exports.resolveUser = async (req, res) => {
       requestId: req.requestId,
     });
   } catch (err) {
-    console.error('Resolve Vanguard user error:', err);
+    logError('Resolve Vanguard user error:', err);
     return res.status(500).json({
       message: 'Failed to resolve the Continental ID account.',
       requestId: req.requestId,
@@ -182,7 +183,7 @@ exports.flagUser = async (req, res) => {
       requestId: req.requestId,
     });
   } catch (err) {
-    console.error('Flag Vanguard user error:', err);
+    logError('Flag Vanguard user error:', err);
     return res.status(500).json({
       message: 'Failed to flag the Continental ID account.',
       requestId: req.requestId,
@@ -213,7 +214,7 @@ exports.unflagUser = async (req, res) => {
       requestId: req.requestId,
     });
   } catch (err) {
-    console.error('Unflag Vanguard user error:', err);
+    logError('Unflag Vanguard user error:', err);
     return res.status(500).json({
       message: 'Failed to unflag the Continental ID account.',
       requestId: req.requestId,

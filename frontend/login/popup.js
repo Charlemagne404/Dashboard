@@ -1064,7 +1064,7 @@ const attemptExistingSessionReuse = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ targetOrigin }),
     });
     const data = await parseJson(response);
 
@@ -1112,7 +1112,7 @@ const requestAuth = async (endpoint, body, submitButton, labels) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, targetOrigin }),
     });
     const data = await parseJson(res);
 
@@ -1212,7 +1212,7 @@ const handlePasskeySignIn = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ credential }),
+      body: JSON.stringify({ credential, targetOrigin }),
     });
     const verifyPayload = await parseJson(verifyResponse);
 

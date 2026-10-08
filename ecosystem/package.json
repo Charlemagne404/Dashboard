@@ -1,0 +1,11 @@
+{
+  "name": "continental-ecosystem-tests",
+  "private": true,
+  "scripts": {
+    "test:contract": "node --test contract.test.cjs",
+    "test:ecosystem": "node --test --test-concurrency=1 harness.test.cjs ecosystem.test.cjs",
+    "test:chaos": "ECOSYSTEM_CHAOS=1 node --test --test-concurrency=1 harness.test.cjs ecosystem.test.cjs",
+    "test:browser": "ECOSYSTEM_BROWSER=1 node --test --test-concurrency=1 harness.test.cjs ecosystem.test.cjs",
+    "test:all": "npm run test:contract && ECOSYSTEM_BROWSER=1 ECOSYSTEM_CHAOS=1 node --test --test-concurrency=1 harness.test.cjs ecosystem.test.cjs"
+  }
+}

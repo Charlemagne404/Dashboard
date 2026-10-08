@@ -21,8 +21,6 @@ const USER_PERMISSIONS = Object.freeze(
   Object.fromEntries(Object.keys(OWNER_PERMISSIONS).map((key) => [key, false]))
 );
 
-const sanitizeEmail = (value) => String(value || '').trim().toLowerCase();
-
 const normalizeAccountRole = (value) =>
   String(value || '').trim().toLowerCase() === ACCOUNT_ROLE_OWNER
     ? ACCOUNT_ROLE_OWNER
@@ -35,20 +33,6 @@ const normalizeAccountStatus = (value) =>
 
 const isOwnerRole = (value) => normalizeAccountRole(value) === ACCOUNT_ROLE_OWNER;
 const isSuspendedAccount = (value) => normalizeAccountStatus(value) === ACCOUNT_STATUS_SUSPENDED;
-
-const getConfiguredOwnerEmails = () =>
-  Array.from(
-    new Set(
-      [
-        ...String(process.env.CONTINENTAL_OWNER_EMAILS || '').split(','),
-        ...String(process.env.OWNER_EMAILS || '').split(','),
-      ]
-        .map((entry) => sanitizeEmail(entry))
-        .filter(Boolean)
-    )
-  );
-
-const shouldAutoGrantOwnerRole = (email) => getConfiguredOwnerEmails().includes(sanitizeEmail(email));
 
 const buildAuthorityPayload = (user = {}) => {
   const role = normalizeAccountRole(user?.accountRole);
@@ -75,6 +59,5 @@ module.exports = {
   normalizeAccountStatus,
   isOwnerRole,
   isSuspendedAccount,
-  shouldAutoGrantOwnerRole,
   buildAuthorityPayload,
 };

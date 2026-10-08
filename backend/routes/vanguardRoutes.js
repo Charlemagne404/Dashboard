@@ -1,5 +1,7 @@
 const express = require('express');
 const ctrl = require('../controllers/vanguardController');
+const asyncHandler = require('../middleware/asyncHandler');
+for (const [name, handler] of Object.entries(ctrl)) ctrl[name] = asyncHandler(handler);
 const auth = require('../middleware/vanguardAuthMiddleware');
 
 const router = express.Router();

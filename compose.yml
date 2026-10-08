@@ -3,7 +3,7 @@ services:
     image: mongo:7
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
 
@@ -21,9 +21,9 @@ services:
       HOST: 0.0.0.0
       NODE_ENV: development
       HTTPS_MODE: off
-      TRUST_PROXY: 1
+      TRUST_PROXY: "false"
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
 
 volumes:
   mongo-data:

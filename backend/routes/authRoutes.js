@@ -1,7 +1,9 @@
 const express = require('express');
 const auth = require('../middleware/authMiddleware');
 const owner = require('../middleware/ownerMiddleware');
-const ctrl = require('../controllers/authController');
+const asyncHandler = require('../middleware/asyncHandler');
+const ctrl = Object.fromEntries(Object.entries(require('../controllers/authController'))
+  .map(([name, handler]) => [name, asyncHandler(handler)]));
 const verifyEmailCtrl = require('../controllers/verifyEmailController');
 
 const router = express.Router();
@@ -16,7 +18,7 @@ router.post('/resend-verification-public', ctrl.publicResendVerificationEmail);
 router.post('/reset-password', ctrl.resetPassword);
 router.get('/email-preview', ctrl.previewEmailIndex);
 router.get('/email-preview/:type', ctrl.previewEmailHtml);
-router.get('/verify-email', verifyEmailCtrl.verifyEmail);
+router.get('/verify-email', asyncHandler(verifyEmailCtrl.verifyEmail));
 router.get('/public-search', ctrl.searchPublicProfiles);
 router.get('/public/:username', ctrl.getPublicProfile);
 router.get('/oauth/:provider/start', ctrl.startOauthLogin);

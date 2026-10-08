@@ -4,6 +4,7 @@ const DEFAULT_DASHBOARD_URL = 'https://dashboard.continental-hub.com/settings';
 const DEFAULT_GRIMOIRE_ORIGIN = 'https://grimoire.continental-hub.com';
 const DEFAULT_BLUEPRINT_ORIGIN = 'https://blueprint.continental-hub.com';
 const DEFAULT_VANGUARD_ORIGIN = 'https://vanguard.continental-hub.com';
+const DEFAULT_TERRA_TREAD_ORIGIN = 'https://terra-tread.continental-hub.com';
 
 const sanitizeText = (value, maxLength = 2000) => String(value || '').trim().slice(0, maxLength);
 const normalizeOrigin = (value) => sanitizeText(value, 2000).replace(/\/+$/, '');
@@ -27,6 +28,34 @@ const normalizeProviders = (values = []) =>
   );
 
 const DEFAULT_AUTH_APPS = Object.freeze([
+  {
+    appId: 'stepcast', displayName: 'StepCast', status: 'active',
+    allowedOrigins: ['https://stepcast.continental-hub.com'],
+    allowedRedirectOrigins: ['https://stepcast.continental-hub.com'],
+    requiredLinkedProviders: [], policyResolver: null,
+    dashboardUrl: DEFAULT_DASHBOARD_URL, firstParty: true,
+  },
+  {
+    appId: 'terra-tread', displayName: 'Terra Tread', status: 'active',
+    allowedOrigins: [DEFAULT_TERRA_TREAD_ORIGIN],
+    allowedRedirectOrigins: [DEFAULT_TERRA_TREAD_ORIGIN],
+    requiredLinkedProviders: [], policyResolver: null,
+    dashboardUrl: DEFAULT_DASHBOARD_URL, firstParty: true,
+  },
+  {
+    appId: 'pulse', displayName: 'Pulse', status: 'active',
+    allowedOrigins: ['https://pulse.continental-hub.com'],
+    allowedRedirectOrigins: ['https://pulse.continental-hub.com'],
+    requiredLinkedProviders: [], policyResolver: null,
+    dashboardUrl: DEFAULT_DASHBOARD_URL, firstParty: true,
+  },
+  {
+    appId: 'status', displayName: 'Status', status: 'active',
+    allowedOrigins: ['https://status.continental-hub.com'],
+    allowedRedirectOrigins: ['https://status.continental-hub.com'],
+    requiredLinkedProviders: [], policyResolver: null,
+    dashboardUrl: DEFAULT_DASHBOARD_URL, firstParty: true,
+  },
   {
     appId: 'grimoire',
     displayName: 'Grimoire',

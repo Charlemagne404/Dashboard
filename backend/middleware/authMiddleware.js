@@ -1,4 +1,6 @@
 const User = require('../models/User');
+const AuthApp = require('../models/AuthApp');
+const { isSessionActive } = require('../utils/sessionPolicy');
 const {
   ACCESS_TOKEN_AUDIENCE,
   verifyTypedJwt,
@@ -40,7 +42,6 @@ module.exports = async (req, res, next) => {
       secret: process.env.JWT_SECRET,
       audience: ACCESS_TOKEN_AUDIENCE,
       type: 'access_token',
-      allowLegacy: true,
     });
   } catch (err) {
     return res
@@ -49,7 +50,7 @@ module.exports = async (req, res, next) => {
   }
 
   const userId = String(decoded?.userId || decoded?.sub || '').trim();
-  if (!userId) {
+  if (!/^[a-f0-9]{24}$/i.test(userId) || !decoded.sid || !Number.isInteger(decoded.tokenVersion)) {
     return res
       .status(401)
       .json(buildAuthErrorPayload(req, 'auth/invalid-token', 'Invalid token payload.'));
@@ -57,7 +58,7 @@ module.exports = async (req, res, next) => {
 
   try {
     const user = await User.findById(userId).select(
-      '_id refreshTokenVersion refreshSessions accountRole accountStatus'
+      '_id refreshTokenVersion refreshSessions accountRole accountStatus isVerified security.mfa.enabled'
     );
     if (!user) {
       return res
@@ -71,6 +72,10 @@ module.exports = async (req, res, next) => {
         .json(buildAuthErrorPayload(req, 'auth/account-suspended', 'This account is suspended.'));
     }
 
+    if (!user.isVerified) {
+      return res.status(403).json(buildAuthErrorPayload(req, 'auth/email-unverified', 'Email verification required.'));
+    }
+
     if (user.refreshTokenVersion !== decoded.tokenVersion) {
       return res
         .status(401)
@@ -80,7 +85,7 @@ module.exports = async (req, res, next) => {
     const sid = String(decoded.sid || '').trim();
     if (sid) {
       const hasActiveSession = Array.isArray(user.refreshSessions)
-        ? user.refreshSessions.some((session) => String(session?.sid || '').trim() === sid)
+        ? user.refreshSessions.some((session) => String(session?.sid || '').trim() === sid && isSessionActive(session))
         : false;
 
       if (!hasActiveSession) {
@@ -97,7 +102,24 @@ module.exports = async (req, res, next) => {
       accountRole: normalizeAccountRole(user.accountRole),
       accountStatus: normalizeAccountStatus(user.accountStatus),
       isOwner: isOwnerRole(user.accountRole),
+      mfaEnabled: user.security?.mfa?.enabled === true,
+      sessionCreatedAt: user.refreshSessions.find((session) => session.sid === sid)?.createdAt,
+      targetOrigin: String(decoded.targetOrigin || ''),
+      canManageIdentity: decoded.identityManagement === true &&
+        user.refreshSessions.some((session) => session.sid === sid && session.identityManagement === true),
     };
+
+    const baseUrl = req.baseUrl.toLowerCase();
+    const endpoint = req.path.toLowerCase().replace(/\/+$/, '') || '/';
+    if (baseUrl === '/api/auth' && endpoint !== '/me' && !req.user.canManageIdentity) {
+      return res.status(403).json(buildAuthErrorPayload(req, 'auth/insufficient-scope', 'Use the Continental ID dashboard to manage this account.'));
+    }
+
+    if (baseUrl === '/api/grimoire' && !req.user.canManageIdentity && !(await AuthApp.exists({
+      appId: 'grimoire', status: 'active', allowedOrigins: decoded.targetOrigin,
+    }))) {
+      return res.status(403).json(buildAuthErrorPayload(req, 'auth/insufficient-scope', 'Token is not authorized for Grimoire.'));
+    }
 
     return next();
   } catch (err) {

@@ -8,19 +8,20 @@ const LEGACY_BACKUP_CODE_HASH_PATTERN = /^[a-f0-9]{64}$/i;
 const hashToken = (value) =>
   crypto.createHash('sha256').update(String(value || '')).digest('hex');
 
-const getSecurityKeyMaterial = () =>
-  String(
-    process.env.MFA_SECRET_ENCRYPTION_KEY ||
-      process.env.BACKUP_CODE_SECRET ||
-      process.env.REFRESH_TOKEN_SECRET ||
-      process.env.JWT_SECRET ||
-      ''
-  ).trim();
+const getSecurityKeyMaterials = () =>
+  Array.from(new Set([
+    process.env.MFA_SECRET_ENCRYPTION_KEY,
+    process.env.BACKUP_CODE_SECRET,
+    process.env.REFRESH_TOKEN_SECRET,
+    process.env.JWT_SECRET,
+  ].map((value) => String(value || '').trim()).filter(Boolean)));
 
-const deriveScopedKey = (scope) =>
+const getSecurityKeyMaterial = () => getSecurityKeyMaterials()[0] || '';
+
+const deriveScopedKey = (scope, keyMaterial = getSecurityKeyMaterial()) =>
   crypto
     .createHash('sha256')
-    .update(`${scope}:${getSecurityKeyMaterial()}`)
+    .update(`${scope}:${keyMaterial}`)
     .digest();
 
 const hasEncryptedMfaSecret = (value) =>
@@ -39,11 +40,7 @@ const encryptMfaSecret = (value) => {
   return `${ENCRYPTED_MFA_SECRET_PREFIX}${iv.toString('base64url')}.${tag.toString('base64url')}.${ciphertext.toString('base64url')}`;
 };
 
-const decryptMfaSecret = (value) => {
-  const secret = String(value || '').trim();
-  if (!secret) return '';
-  if (!hasEncryptedMfaSecret(secret)) return secret;
-
+const decryptMfaSecretWithKey = (secret, keyMaterial) => {
   const payload = secret.slice(ENCRYPTED_MFA_SECRET_PREFIX.length);
   const [ivPart, tagPart, ciphertextPart] = payload.split('.');
   if (!ivPart || !tagPart || !ciphertextPart) return '';
@@ -52,7 +49,7 @@ const decryptMfaSecret = (value) => {
     const iv = Buffer.from(ivPart, 'base64url');
     const tag = Buffer.from(tagPart, 'base64url');
     const ciphertext = Buffer.from(ciphertextPart, 'base64url');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', deriveScopedKey('mfa-secret'), iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', deriveScopedKey('mfa-secret', keyMaterial), iv);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
   } catch {
@@ -60,14 +57,27 @@ const decryptMfaSecret = (value) => {
   }
 };
 
-const protectBackupCodeHash = (hash) => {
+const decryptMfaSecret = (value) => {
+  const secret = String(value || '').trim();
+  if (!secret) return '';
+  if (!hasEncryptedMfaSecret(secret)) return secret;
+
+  for (const keyMaterial of getSecurityKeyMaterials()) {
+    const decrypted = decryptMfaSecretWithKey(secret, keyMaterial);
+    if (decrypted) return decrypted;
+  }
+
+  return '';
+};
+
+const protectBackupCodeHash = (hash, keyMaterial = getSecurityKeyMaterial()) => {
   const normalizedHash = String(hash || '').trim().toLowerCase();
   if (!LEGACY_BACKUP_CODE_HASH_PATTERN.test(normalizedHash)) {
     return '';
   }
 
   const protectedHash = crypto
-    .createHmac('sha256', deriveScopedKey('backup-code'))
+    .createHmac('sha256', deriveScopedKey('backup-code', keyMaterial))
     .update(normalizedHash)
     .digest('hex');
 
@@ -88,11 +98,19 @@ const verifyStoredBackupCodeHash = (storedHash, code) => {
   if (!normalizedStoredHash || !code) return false;
 
   if (normalizedStoredHash.startsWith(PROTECTED_BACKUP_CODE_PREFIX)) {
-    return normalizedStoredHash === hashBackupCodeForStorage(code);
+    const stored = Buffer.from(normalizedStoredHash);
+    let matched = false;
+    for (const keyMaterial of getSecurityKeyMaterials()) {
+      const expected = Buffer.from(protectBackupCodeHash(hashToken(code), keyMaterial));
+      if (stored.length === expected.length) {
+        matched = crypto.timingSafeEqual(stored, expected) || matched;
+      }
+    }
+    return matched;
   }
 
   if (LEGACY_BACKUP_CODE_HASH_PATTERN.test(normalizedStoredHash)) {
-    return normalizedStoredHash.toLowerCase() === hashToken(code);
+    return crypto.timingSafeEqual(Buffer.from(normalizedStoredHash.toLowerCase()), Buffer.from(hashToken(code)));
   }
 
   return false;

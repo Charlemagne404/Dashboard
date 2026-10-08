@@ -320,7 +320,7 @@ test('bootstrap succeeds with an inline access token only for a registered app',
   assert.equal(bootstrapResponse.body.app.appId, 'grimoire');
   assert.equal(bootstrapResponse.body.user.email, 'bootstrap.inline@example.com');
   assert.equal(bootstrapResponse.body.session.canRefresh, false);
-  assert.equal(bootstrapResponse.body.accessToken, loginResponse.body.accessToken);
+  assert.equal(jwt.decode(bootstrapResponse.body.accessToken).identityManagement, false);
 });
 
 test('bootstrap returns a machine-readable error for unknown apps', async () => {
@@ -614,7 +614,7 @@ test('refresh_token returns a machine-readable auth reason when no refresh cooki
   assert.ok(response.body.error.correlationId);
 });
 
-test('the first registered account becomes the bootstrap owner account', async () => {
+test('public registration never grants owner access, including the first account', async () => {
   const response = await request(app)
     .post('/api/auth/register')
     .set('Origin', TEST_ORIGIN)
@@ -630,7 +630,7 @@ test('the first registered account becomes the bootstrap owner account', async (
 
   const createdUser = await User.findOne({ email: 'bootstrap.owner@example.com' }).lean();
   assert.ok(createdUser);
-  assert.equal(createdUser.accountRole, 'owner');
+  assert.equal(createdUser.accountRole, 'user');
   assert.equal(createdUser.accountStatus, 'active');
 });
 
@@ -657,7 +657,7 @@ test('non-owner accounts cannot access owner management endpoints', async () => 
 });
 
 test('owner accounts can review users and suspend a target account', async () => {
-  const owner = await createVerifiedUser({
+  await createVerifiedUser({
     email: 'owner@example.com',
     username: 'owner.user',
     accountRole: 'owner',

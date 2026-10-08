@@ -2,6 +2,15 @@ const { Resend } = require('resend');
 
 let cachedClient = null;
 
+class BoundedResend extends Resend {
+  // Provider errors can echo recipient and payload values. Callers log bounded metadata.
+  logError() {}
+
+  fetchRequest(path, options = {}) {
+    return super.fetchRequest(path, { ...options, signal: AbortSignal.timeout(8000), redirect: 'error' });
+  }
+}
+
 const hasResendConfig = () => {
   return Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
 };
@@ -12,7 +21,7 @@ const getResendClient = () => {
   }
 
   if (!cachedClient) {
-    cachedClient = new Resend(process.env.RESEND_API_KEY);
+    cachedClient = new BoundedResend(process.env.RESEND_API_KEY, { baseUrl: 'https://api.resend.com' });
   }
 
   return cachedClient;
@@ -34,6 +43,10 @@ const buildFromHeader = () => {
 };
 
 async function sendEmail({ to, subject, html, text, replyTo } = {}) {
+  // Tests must never inherit real mail credentials from a developer's .env.
+  if (process.env.NODE_ENV === 'test') {
+    return { skipped: true, reason: 'test_environment' };
+  }
   if (!to) {
     throw new Error('Email recipient is required.');
   }
@@ -69,8 +82,7 @@ async function sendEmail({ to, subject, html, text, replyTo } = {}) {
 
   const { data, error } = await resend.emails.send(payload);
   if (error) {
-    const err = new Error(error.message || 'Resend email request failed.');
-    err.cause = error;
+    const err = new Error('Email provider request failed.');
     throw err;
   }
 

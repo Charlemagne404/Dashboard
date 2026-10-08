@@ -318,7 +318,7 @@
         <div class="privacy-meta">
           <div class="privacy-meta-card">
             <strong>Last updated</strong>
-            <span>April 4, 2026</span>
+            <span>September 30, 2026</span>
           </div>
           <div class="privacy-meta-card">
             <strong>What this covers</strong>
@@ -326,7 +326,7 @@
           </div>
           <div class="privacy-meta-card">
             <strong>Core approach</strong>
-            <span>Short-lived access tokens stay in memory, refresh sessions use secure cookies, and local browser storage is limited to interface preferences.</span>
+            <span>Short-lived access tokens stay in memory, refresh sessions use secure cookies, and local browser storage holds interface and connection preferences, not refresh credentials.</span>
           </div>
         </div>
       </div>
@@ -394,6 +394,7 @@
           <h2>Cookies and local storage</h2>
           <ul>
             <li>Secure authentication cookies are used to maintain refresh sessions and keep you signed in between page loads.</li>
+            <li>Refresh cookies are host-only. A separate signed device-recognition cookie may be shared across Continental subdomains; it is not a login credential or an MFA bypass.</li>
             <li>Limited local browser storage may be used for interface settings such as theme, density, reduced-motion preferences, active tab state, and cookie notice acknowledgement.</li>
             <li>Browser storage is used to improve the dashboard experience, not to build advertising profiles across unrelated sites.</li>
           </ul>
@@ -409,6 +410,7 @@
           <ul>
             <li>We may use infrastructure and service providers that help operate the product, such as hosting, authentication support, and email delivery.</li>
             <li>If you connect an external identity provider, we exchange the minimum information needed to complete sign-in or account linking for that provider.</li>
+            <li>Connected Continental applications currently receive stable account identifiers, primary email and basic display information. Provider identifiers may also be supplied when an application's access policy requires that linked provider. Account-management settings and login IP history are not included in ordinary application identity responses.</li>
             <li>Profile information that is marked public may be visible to other people according to your visibility settings.</li>
             <li>We may disclose information if reasonably necessary to investigate abuse, protect the service, or comply with legal obligations.</li>
           </ul>
@@ -421,6 +423,7 @@
             <li>The product is designed around hardened session handling, refresh-token invalidation, sign-in throttling, and device or session tracking for account protection.</li>
             <li>Sensitive security material such as passwords is stored as hashes, and backup codes are stored in hardened form rather than plain text.</li>
             <li>Security histories such as recent logins, audit events, known devices, and active sessions are capped so they do not grow without limit.</li>
+            <li>History count limits are not automatic time-based deletion. Backup and infrastructure-log retention depend on the deployment's operational policies.</li>
             <li>Information is retained for as long as it is needed to operate the account, enforce security controls, or satisfy legal and operational requirements.</li>
           </ul>
         </section>
@@ -433,7 +436,7 @@
             <li>Choose which profile fields can appear publicly, including whether linked accounts or personal details are exposed.</li>
             <li>Review and revoke active sessions, rotate credentials, enable or disable MFA, and manage passkeys.</li>
             <li>Export your account data from the dashboard when you want a copy of the information associated with your account.</li>
-            <li>Permanently delete your account from the dashboard if you no longer want to use the service.</li>
+            <li>Delete your account from the dashboard if you no longer want to use the service. Live-account access is removed immediately; dependent application data cleanup can be deferred if storage is unavailable. Previously created backups are subject to the deployment's retention and restore policies.</li>
           </ul>
         </section>
 

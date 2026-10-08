@@ -1091,6 +1091,21 @@ const clearMfaManageInputs = () => {
   if (dom.mfaManageChallenge) dom.mfaManageChallenge.value = '';
 };
 
+const requestIdentityCredentials = async (actionLabel) => {
+  const mfaRequired = requiresSensitiveActionMfa();
+  const result = await openDecisionModal({
+    title: actionLabel,
+    copy: 'Confirm your current password to change a sign-in method.',
+    confirmLabel: 'Continue',
+    fields: [
+      { id: 'identity-current-password', name: 'currentPassword', label: 'Current password', type: 'password', autocomplete: 'current-password', required: true },
+      ...(mfaRequired ? [{ id: 'identity-mfa-code', name: 'challenge', label: 'Authenticator code or backup code', autocomplete: 'one-time-code', required: true }] : []),
+    ],
+  });
+  return result ? { currentPassword: result.currentPassword,
+    ...(mfaRequired ? parseSensitiveMfaInput(result.challenge) : {}) } : null;
+};
+
 const getMfaManageConfig = (mode = state.mfaManageMode) => {
   if (mode === 'disable') {
     return {
@@ -5128,6 +5143,11 @@ const renderPasskeys = (user = state.user) => {
         clearPasskeyInputs();
         fillSecurity(state.user);
         showToast(data.message || 'Passkey removed.', 'success');
+        if (data.forceRelogin) {
+          clearStoredAuth();
+          stopSessionAutoRefresh();
+          setLoggedOutUI();
+        }
       } catch (error) {
         showToast(error.message || 'Failed to remove the passkey.', 'error');
       } finally {
@@ -6298,6 +6318,8 @@ const handleOauthLink = async (provider) => {
   const normalizedProvider = safeText(provider).toLowerCase();
   const providerLabel = getOauthProviderLabel(normalizedProvider);
   const elements = getOauthProviderElements(normalizedProvider);
+  const credentials = await requestIdentityCredentials(`Link ${providerLabel}`);
+  if (!credentials) return;
 
   setButtonBusy(elements.connectBtn, true, `Opening ${providerLabel}...`);
 
@@ -6305,6 +6327,7 @@ const handleOauthLink = async (provider) => {
     const data = await apiRequest(`/oauth/${encodeURIComponent(normalizedProvider)}/link-start`, {
       method: 'POST',
       body: {
+        ...credentials,
         origin: window.location.origin,
         redirect: window.location.href,
         returnTo: window.location.href,
@@ -6331,12 +6354,7 @@ const handleOauthUnlink = async (provider) => {
   const normalizedProvider = safeText(provider).toLowerCase();
   const providerLabel = getOauthProviderLabel(normalizedProvider);
   const elements = getOauthProviderElements(normalizedProvider);
-  const decision = await openDecisionModal({
-    title: `Unlink ${providerLabel}`,
-    copy: `This disconnects ${providerLabel} from this Continental ID account.`,
-    confirmLabel: `Unlink ${providerLabel}`,
-    confirmClassName: 'danger-btn',
-  });
+  const decision = await requestIdentityCredentials(`Unlink ${providerLabel}`);
   if (!decision) {
     return;
   }
@@ -6346,9 +6364,12 @@ const handleOauthUnlink = async (provider) => {
   try {
     const data = await apiRequest(`/oauth/${encodeURIComponent(normalizedProvider)}`, {
       method: 'DELETE',
-      body: {},
+      body: decision,
     });
-
+    if (data.forceRelogin) {
+      handleUnauthenticatedState({ message: data.message });
+      return;
+    }
     syncUiWithUser(normalizeUserPayload(data));
     showToast(data.message || `${providerLabel} unlinked.`, 'success');
     setSyncStatus(new Date());
@@ -7937,6 +7958,7 @@ const setupEventHandlers = () => {
 
   window.addEventListener('message', async (event) => {
     if (!isTrustedLoginOrigin(event.origin)) return;
+    if (!state.loginPopupWindow || event.source !== state.loginPopupWindow) return;
     const authResult = parseAuthResultPayload(event.data);
     if (!authResult) return;
 

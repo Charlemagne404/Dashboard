@@ -1,4 +1,9 @@
-require('dotenv').config();
+if (process.env.NODE_ENV !== 'test') require('dotenv').config({ path: process.env.DOTENV_CONFIG_PATH });
+const { assertRuntimeConfig } = require('./utils/runtimeConfig');
+try { assertRuntimeConfig(); } catch (err) {
+  console.error(`Invalid runtime configuration: ${err.message}`);
+  process.exit(1);
+}
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -13,13 +18,16 @@ const ApiRateLimitBucket = require('./models/ApiRateLimitBucket');
 const AuthApp = require('./models/AuthApp');
 const LoginThrottle = require('./models/LoginThrottle');
 const User = require('./models/User');
+const AuthChallenge = require('./models/AuthChallenge');
+const { cleanupPendingAccountDeletions } = require('./utils/accountDeletion');
+const { logError } = require('./utils/safeLog');
+const { getClientIpKey } = require('./utils/clientIp');
+const asyncHandler = require('./middleware/asyncHandler');
+const authRateLimiter = require('./middleware/authRateLimiter');
 const authRoutes = require('./routes/authRoutes');
 const grimoireRoutes = require('./routes/grimoireRoutes');
 const vanguardRoutes = require('./routes/vanguardRoutes');
-const { dedupePasskeysAcrossUsers } = require('./utils/passkeyHardening');
 const { seedDefaultAuthApps } = require('./utils/authApps');
-const { migrateUsersToLatestSecurityState } = require('./utils/securityHardening');
-const { migrateUsersToLatestIdentity } = require('./utils/userIdentity');
 
 const app = express();
 
@@ -31,6 +39,8 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'https://login.continental-hub.com',
   'https://pulse.continental-hub.com',
   'https://stepcast.continental-hub.com',
+  'https://status.continental-hub.com',
+  'https://terra-tread.continental-hub.com',
   'https://vanguard.continental-hub.com',
   'https://mpmc.ddns.net',
 ];
@@ -84,9 +94,9 @@ const config = {
   httpsMode: resolveHttpsMode(process.env.HTTPS_MODE),
 };
 const allowDefaultTrustedOrigins =
-  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || 'true') !== 'false';
+  String(process.env.ALLOW_DEFAULT_TRUSTED_ORIGINS || (isProduction ? 'false' : 'true')) !== 'false';
 const allowLocalDevOrigins =
-  !isProduction || String(process.env.ALLOW_LOCALHOST_ORIGINS || 'false') === 'true';
+  String(process.env.ALLOW_LOCALHOST_ORIGINS || (isProduction ? 'false' : 'true')) === 'true';
 
 config.allowedOrigins = Array.from(
   new Set([
@@ -147,32 +157,19 @@ if (isProduction) {
   }
 }
 app.disable('x-powered-by');
-app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY, isProduction ? 1 : false));
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY, false));
 
 app.use((req, res, next) => {
-  const requestId = crypto.randomUUID();
+  const incoming = String(req.headers['x-request-id'] || '');
+  const requestId = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(incoming)
+    ? incoming : crypto.randomUUID();
   req.requestId = requestId;
   res.setHeader('X-Request-Id', requestId);
   return next();
 });
 
 app.use((req, res, next) => {
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
-    .split(',')[0]
-    .trim()
-    .toLowerCase();
-  const originLikeUrl = String(req.headers.origin || req.headers.referer || '').trim();
-  let browserProtocol = '';
-  if (originLikeUrl) {
-    try {
-      browserProtocol = new URL(originLikeUrl).protocol.replace(':', '').toLowerCase();
-    } catch {
-      browserProtocol = '';
-    }
-  }
-
-  const isSecureRequest =
-    req.secure || forwardedProto === 'https' || (!forwardedProto && browserProtocol === 'https');
+  const isSecureRequest = req.secure;
 
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -186,9 +183,15 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '512kb' }));
 app.use(express.urlencoded({ extended: false, limit: '200kb' }));
 app.use(cookieParser());
+app.use((req, res, next) => {
+  if (req.body && (typeof req.body !== 'object' || Array.isArray(req.body))) {
+    return res.status(400).json({ message: 'Request body must be a JSON object.', requestId: req.requestId });
+  }
+  return next();
+});
 
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 
@@ -212,7 +215,7 @@ const isAllowedOrigin = (origin) => {
   return allowedOriginsSet.has(normalizedOrigin);
 };
 
-const getClientKey = (req) => String(req.ip || 'unknown').trim().slice(0, 80) || 'unknown';
+const getClientKey = getClientIpKey;
 
 const extractBrowserOrigin = (req) => {
   const headerOrigin = normalizeOrigin(req.headers.origin);
@@ -229,6 +232,7 @@ const extractBrowserOrigin = (req) => {
 };
 
 const browserProtectedAuthRoutes = new Set([
+  '/bootstrap',
   '/login',
   '/register',
   '/logout',
@@ -247,12 +251,16 @@ const browserProtectedAuthRoutes = new Set([
 ]);
 
 const requireTrustedBrowserOrigin = (req, res, next) => {
-  if (req.method === 'OPTIONS' || !browserProtectedAuthRoutes.has(req.path)) {
+  const endpoint = req.path.toLowerCase().replace(/\/+$/, '') || '/';
+  if (req.method === 'OPTIONS' || !browserProtectedAuthRoutes.has(endpoint)) {
     return next();
   }
 
   const origin = extractBrowserOrigin(req);
   if (origin && isAllowedOrigin(origin)) {
+    if (Number(req.headers['content-length'] || 0) > 0 && !req.is('application/json')) {
+      return res.status(415).json({ message: 'Use application/json for authentication requests.' });
+    }
     return next();
   }
 
@@ -280,12 +288,13 @@ app.use(
       return callback(new Error('Not allowed by CORS'));
     },
     credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
       'Authorization',
       'X-Vanguard-Api-Key',
       'X-Vanguard-Instance-Id',
+      'X-Request-Id',
     ],
   })
 );
@@ -354,16 +363,20 @@ const apiRateLimiter = async (req, res, next) => {
 };
 
 mongoose.set('bufferCommands', false);
+mongoose.set('autoIndex', !isProduction);
 
 const connectToDatabase = async () => {
   await mongoose.connect(config.mongoUri, {
     maxPoolSize: 10,
     serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 10000,
+    waitQueueTimeoutMS: 5000,
   });
 };
 
 mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error:', err);
+  logError('MongoDB connection error:', err);
 });
 
 const startupMaintenanceState = {
@@ -393,8 +406,8 @@ const runMaintenanceTask = async (label, task, errors) => {
   try {
     await task();
   } catch (err) {
-    errors.push(`${label}: ${err.message || err}`);
-    console.error(`Startup maintenance failed during ${label}:`, err);
+    errors.push(`${label} failed`);
+    logError(`Startup maintenance failed during ${label}:`, err);
   }
 };
 
@@ -412,24 +425,15 @@ const runStartupMaintenance = async () => {
   startupMaintenancePromise = (async () => {
     const errors = [];
 
-    await runMaintenanceTask('user identity migration', () => migrateUsersToLatestIdentity({ logger: console }), errors);
-    await runMaintenanceTask(
-      'user security migration',
-      () => migrateUsersToLatestSecurityState({ logger: console }),
-      errors
-    );
-    await runMaintenanceTask(
-      'passkey dedupe',
-      () => dedupePasskeysAcrossUsers({ logger: console }),
-      errors
-    );
     await runMaintenanceTask('auth app seed', () => seedDefaultAuthApps({ logger: console }), errors);
-    await runMaintenanceTask('auth app index sync', () => AuthApp.syncIndexes(), errors);
-    await runMaintenanceTask('user index sync', () => User.syncIndexes(), errors);
-    await runMaintenanceTask('login throttle index sync', () => LoginThrottle.syncIndexes(), errors);
+    await runMaintenanceTask('account deletion cleanup', cleanupPendingAccountDeletions, errors);
+    await runMaintenanceTask('auth app indexes', () => AuthApp.createIndexes(), errors);
+    await runMaintenanceTask('user indexes', () => User.createIndexes(), errors);
+    await runMaintenanceTask('challenge indexes', () => AuthChallenge.createIndexes(), errors);
+    await runMaintenanceTask('login throttle indexes', () => LoginThrottle.createIndexes(), errors);
     await runMaintenanceTask(
       'api rate limit bucket index sync',
-      () => ApiRateLimitBucket.syncIndexes(),
+      () => ApiRateLimitBucket.createIndexes(),
       errors
     );
 
@@ -440,9 +444,10 @@ const runStartupMaintenance = async () => {
 
     if (errors.length) {
       console.error(
-        'Startup maintenance completed with non-fatal errors:',
+        'Startup maintenance failed:',
         startupMaintenanceState.error
       );
+      throw new Error('Required startup maintenance failed.');
     }
 
     return buildStartupMaintenanceSnapshot();
@@ -452,6 +457,8 @@ const runStartupMaintenance = async () => {
 
   return startupMaintenancePromise;
 };
+
+app.get('/api/live', (_req, res) => res.json({ status: 'ok', service: config.appName }));
 
 app.get('/api/health', (req, res) => {
   const dbConnected = mongoose.connection.readyState === 1;
@@ -482,7 +489,7 @@ app.use((req, res, next) => {
 
 app.use('/api', apiRateLimiter);
 
-app.use('/api/auth', requireTrustedBrowserOrigin, authRoutes);
+app.use('/api/auth', requireTrustedBrowserOrigin, asyncHandler(authRateLimiter), authRoutes);
 app.use('/api/grimoire', grimoireRoutes);
 app.use('/api/vanguard', vanguardRoutes);
 
@@ -493,7 +500,7 @@ app.use('/api', (req, res) => {
   });
 });
 
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   if (err?.message === 'Not allowed by CORS') {
     return res.status(403).json({
       message: 'CORS origin denied.',
@@ -501,9 +508,13 @@ app.use((err, req, res, next) => {
     });
   }
 
-  console.error(`[${req.requestId}]`, err);
-  return res.status(500).json({
-    message: 'Internal server error.',
+  if (err?.type === 'entity.parse.failed' || err?.type === 'entity.too.large') {
+    return res.status(err.type === 'entity.too.large' ? 413 : 400).json({ message: 'Invalid request body.', requestId: req.requestId });
+  }
+  logError(`[${req.requestId}]`, err);
+  const unavailable = ['MongoNetworkError', 'MongoServerSelectionError', 'MongooseError'].includes(err?.name);
+  return res.status(unavailable ? 503 : 500).json({
+    message: unavailable ? 'Database unavailable. Retry shortly.' : 'Internal server error.',
     requestId: req.requestId,
   });
 });
@@ -517,9 +528,10 @@ const startServer = async () => {
 
   try {
     await connectToDatabase();
+    await runStartupMaintenance();
     console.log('MongoDB connected');
   } catch (err) {
-    console.error('Server startup failed:', err);
+    logError('Server startup failed:', err);
     process.exit(1);
   }
 
@@ -541,7 +553,6 @@ const startServer = async () => {
       server.listen(config.port, config.host, resolve);
     });
     console.log(`Auth service HTTPS running on https://${config.host}:${config.port}`);
-    void runStartupMaintenance();
     return server;
   }
 
@@ -550,7 +561,6 @@ const startServer = async () => {
     server.listen(config.port, config.host, resolve);
   });
   console.log(`Auth service HTTP running on http://${config.host}:${config.port}`);
-  void runStartupMaintenance();
   return server;
 };
 
@@ -574,7 +584,7 @@ const shutdown = async (signal) => {
     await stopServer();
     process.exit(0);
   } catch (err) {
-    console.error('Error during shutdown:', err);
+    logError('Error during shutdown:', err);
     process.exit(1);
   }
 };
